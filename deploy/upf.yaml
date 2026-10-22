@@ -1,0 +1,101 @@
+# UPF fabric: 2-node StatefulSet + headless Service.
+#
+# StatefulSet gives each node a stable identity (upf-0, upf-1) and stable
+# DNS (upf-0.upf-hs.telco.svc.cluster.local) — the UPF derives its node
+# ordinal from the Pod name and resolves peers via UPF_PEER_DNS.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: upf
+  namespace: telco
+  labels:
+    app: upf
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  serviceName: upf-hs
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: upf
+  template:
+    metadata:
+      labels:
+        app: upf
+        app.kubernetes.io/part-of: telco-upf-gen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+        securityContextConstraints:
+          name: upf-udp
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: upf
+          image: quay.io/midu/upf:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: n3, containerPort: 2152, protocol: UDP }
+            - { name: n5, containerPort: 2153, protocol: UDP }
+            - { name: n9, containerPort: 2154, protocol: UDP }
+            - { name: metrics, containerPort: 8080, protocol: TCP }
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: UPF_NODES
+              value: "2"
+            - name: UPF_PEER_DNS
+              value: upf-{n}.upf-hs.telco.svc.cluster.local
+            - name: UPF_SESSIONS
+              value: "256"
+            - name: UPF_WORKERS
+              value: "4"
+            - name: N3_PORT
+              value: "2152"
+            - name: N5_PORT
+              value: "2153"
+            - name: N9_PORT
+              value: "2154"
+            # Plain-IP decaps are absorbed (synthetic internet). Point this
+            # at a real sink, e.g. "dn-sink.telco.svc.cluster.local:9999",
+            # to observe demuxed user traffic.
+            - name: DN_TARGET
+              value: ""
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+---
+# Headless: every node gets A records for stable peer DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: upf-hs
+  namespace: telco
+  labels:
+    app: upf
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  clusterIP: None
+  selector:
+    app: upf
+  ports:
+    - { name: n3, port: 2152, targetPort: 2152, protocol: UDP }
+    - { name: n5, port: 2153, targetPort: 2153, protocol: UDP }
+    - { name: n9, port: 2154, targetPort: 2154, protocol: UDP }
+    - { name: metrics, port: 8080, targetPort: 8080, protocol: TCP }

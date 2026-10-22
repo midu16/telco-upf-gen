@@ -1,0 +1,51 @@
+# SCC for the UPF fabric.
+#
+# The simulator uses plain UDP sockets (no AF_PACKET / raw sockets), so it
+# does not need the privileged SCC. It does need:
+#   - RunAsAny           : images run as embedded uid 10001 (distroless)
+#   - NET_BIND_SERVICE   : N3/N5/N9 data ports 2152-2154 are below 1024
+#
+# Effective capability set = allowedCapabilities minus requiredDrop, so the
+# containers end up with exactly [NET_BIND_SERVICE] — nothing else.
+# No host namespaces, no host directories, no privilege escalation, no raw
+# sockets (the capability set below cannot express AF_PACKET).
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: upf-udp
+  annotations:
+    openshift.io/description: >-
+      Non-root UDP workload for the 5G UPF simulator. Binds GTP-U data
+      ports 2152-2154 below 1024 via NET_BIND_SERVICE. No raw sockets,
+      no host namespaces.
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegeContainer: false
+allowPrivilegeEscalation: false
+allowedCapabilities:
+  - NET_BIND_SERVICE
+allowedSeccompProfiles:
+  - RuntimeDefault
+fsGroup:
+  type: RunAsAny
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+  - ALL
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+users:
+  - system:serviceaccounts:telco
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret

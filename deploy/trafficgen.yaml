@@ -1,0 +1,79 @@
+# Traffic generators: 2-replica StatefulSet + headless Service.
+#
+# Each generator discovers the UPF fabric via /api/teids and fans token-bucket
+# GTP-U flows across N3 (uplink), N5 (downlink) and the N9 east-west path.
+# StatefulSet keeps pod identity/DNS stable so the Web UI can address both
+# replicas by name.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trafficgen
+  namespace: telco
+  labels:
+    app: trafficgen
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  serviceName: tg-hs
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: trafficgen
+  template:
+    metadata:
+      labels:
+        app: trafficgen
+        app.kubernetes.io/part-of: telco-upf-gen
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+        securityContextConstraints:
+          name: upf-udp
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: trafficgen
+          image: quay.io/midu/trafficgen:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: metrics, containerPort: 8080, protocol: TCP }
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: UPF_NODES
+              value: "2"
+            - name: UPF_PEER_DNS
+              value: upf-{n}.upf-hs.telco.svc.cluster.local
+            - name: UPF_METRICS_PORT
+              value: "8080"
+            # per-flow rate; ~64 flows/replica => ~6.4k pps per generator at 100
+            - name: TG_PPS
+              value: "100"
+            - name: TG_MAX_SESSIONS
+              value: "32"
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tg-hs
+  namespace: telco
+  labels:
+    app: trafficgen
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  clusterIP: None
+  selector:
+    app: trafficgen
+  ports:
+    - { name: metrics, port: 8080, targetPort: 8080, protocol: TCP }

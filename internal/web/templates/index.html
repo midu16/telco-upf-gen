@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5G UPF Fabric &mdash; telco-upf-gen</title>
+<style>
+:root{
+  --bg:#0b0f14; --panel:#10161f; --panel2:#0d131b; --border:#1f2937;
+  --text:#e5e7eb; --mut:#7d8b9c;
+  --n3:#38bdf8; --n5:#34d399; --n9:#f59e0b; --ok:#22c55e; --down:#ef4444;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 22px;
+  border-bottom:1px solid var(--border);background:var(--panel2)}
+header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:1px}
+header .sub{color:var(--mut);font-size:12px}
+.badge{margin-left:auto;font-size:11px;padding:3px 10px;border-radius:999px;
+  border:1px solid var(--border);color:var(--mut);white-space:nowrap}
+.badge.live{color:var(--ok);border-color:rgba(34,197,94,.45)}
+main{padding:18px 22px 40px;max-width:1440px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;padding:14px 16px}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
+  color:var(--mut);margin:0 0 12px}
+#fabric{width:100%;height:330px;display:block}
+.legend{display:flex;gap:18px;margin-top:10px;font-size:12px;color:var(--mut);flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
+.cols{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-top:16px}
+#chart{width:100%;height:110px;display:block}
+#totals{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+#totals div{margin-top:4px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-top:16px}
+.pod .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dot{width:9px;height:9px;border-radius:50%;flex:none}
+.dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(34,197,94,.7)}
+.dot.down{background:var(--down)}
+.pod .name{font-weight:600}
+.pod .url{color:var(--mut);font-size:11px;margin-left:auto;
+  font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;max-width:46%}
+.ifaces{display:grid;gap:8px}
+.ifc{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.ifc .t{font-size:11px;font-weight:700;letter-spacing:.5px}
+.ifc .c3{color:var(--n3)} .ifc .c5{color:var(--n5)} .ifc .c9{color:var(--n9)}
+.ifc .row{display:flex;justify-content:space-between;font-size:12px;margin-top:4px;
+  font-family:ui-monospace,Menlo,monospace}
+.mut{color:var(--mut)}
+table{width:100%;border-collapse:collapse;font-size:12px;
+  font-family:ui-monospace,Menlo,monospace}
+th,td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
+th{color:var(--mut);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+th:first-child,td:first-child{text-align:left}
+th:nth-child(2),td:nth-child(2){text-align:left}
+tr:hover td{background:rgba(255,255,255,.02)}
+@media(max-width:1100px){.cols{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>5G UPF FABRIC</h1>
+  <span class="sub">{{.UpfCount}} UPF &times; {{.TgCount}} TG &mdash; N3 / N5 / N9 GTP-U live view</span>
+  <span class="badge" id="status">connecting&hellip;</span>
+</header>
+<main>
+  <div class="card">
+    <h2>Traffic fabric</h2>
+    <canvas id="fabric"></canvas>
+    <div class="legend">
+      <span><i style="background:#38bdf8"></i>N3 &middot; gNB/UE &harr; UPF (anchored UL/DL)</span>
+      <span><i style="background:#34d399"></i>N5 &middot; DN &harr; UPF (north-south)</span>
+      <span><i style="background:#f59e0b"></i>N9 &middot; UPF &harr; UPF (east-west)</span>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="card"><h2>Aggregate ingest (UPF side)</h2><canvas id="chart"></canvas></div>
+    <div class="card"><h2>This poll</h2><div id="totals">waiting for data&hellip;</div></div>
+  </div>
+
+  <div class="grid" id="pods"></div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Interfaces</h2>
+    <table>
+      <thead><tr>
+        <th>pod</th><th>iface</th><th>rx pps</th><th>tx pps</th><th>tx B/s</th>
+        <th>rx pkts</th><th>tx pkts</th><th>encap</th><th>decap</th><th>dropped</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const POLL_MS = 2000;
+const COL = { N3: "#38bdf8", N5: "#34d399", N9: "#f59e0b" };
+const prev = new Map();     // "pod|iface|field" -> {ts, v}
+const history = [];         // {total}
+let last = null;
+
+const fabric = document.getElementById("fabric");
+const fctx = fabric.getContext("2d");
+const chart = document.getElementById("chart");
+const cctx = chart.getContext("2d");
+
+function fmt(n) {
+  n = Math.max(0, n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "G";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
+function ifacemap(d) {
+  const m = {};
+  ((d && d.ifaces) || []).forEach(f => { m[f.name] = f; });
+  return m;
+}
+
+// Compute rates for all fields of the given ifaces; writes per-poll samples
+// into `prev` exactly once each, so it must be called once per (pod, iface).
+function rates(d, ifList) {
+  const r = {};
+  ifList.forEach(i => {
+    const f = d.ifs[i] || {};
+    ["rxPkts", "txPkts", "txBytes", "rxBytes"].forEach(field => {
+      const k = d.name + "|" + i + "|" + field;
+      const v = f[field] || 0;
+      const p = prev.get(k);
+      let val = 0;
+      if (p && d.ts > p.ts) val = Math.max(0, (v - p.v) / ((d.ts - p.ts) / 1000));
+      prev.set(k, { ts: d.ts, v });
+      r[i + "_" + field] = val;
+    });
+  });
+  return r;
+}
+
+function place(n, y, W, H) {
+  return Array.from({ length: n }, (_, i) =>
+    n === 1 ? { x: W / 2, y } : { x: W * (0.18 + 0.64 * i / (n - 1)), y });
+}
+
+function rrect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+function curveEdge(a, b, pps, color, dip, now) {
+  if (pps <= 0.01) return;
+  const w = Math.max(1.2, Math.min(11, 1 + pps / 50));
+  const mx = (a.x + b.x) / 2, my = ((a.y + b.y) / 2) + dip;
+  fctx.save();
+  fctx.globalAlpha = 0.65;
+  fctx.strokeStyle = color;
+  fctx.lineWidth = w;
+  fctx.lineCap = "round";
+  fctx.shadowColor = color;
+  fctx.shadowBlur = 9;
+  fctx.setLineDash([11, 9]);
+  fctx.lineDashOffset = -(now / 34) % 20;
+  fctx.beginPath();
+  fctx.moveTo(a.x, a.y);
+  fctx.quadraticCurveTo(mx, my, b.x, b.y);
+  fctx.stroke();
+  const ang = Math.atan2(b.y - my, b.x - mx);
+  fctx.setLineDash([]);
+  fctx.fillStyle = color;
+  fctx.beginPath();
+  fctx.moveTo(b.x, b.y);
+  fctx.lineTo(b.x - 11 * Math.cos(ang - 0.42), b.y - 11 * Math.sin(ang - 0.42));
+  fctx.lineTo(b.x - 11 * Math.cos(ang + 0.42), b.y - 11 * Math.sin(ang + 0.42));
+  fctx.closePath();
+  fctx.fill();
+  if (pps > 0.5) {
+    fctx.shadowBlur = 0;
+    fctx.globalAlpha = 0.95;
+    fctx.fillStyle = "#dbe4ee";
+    fctx.font = "11px ui-monospace, monospace";
+    fctx.textAlign = "center";
+    fctx.fillText(fmt(pps) + " pps", mx, my + (dip > 0 ? 12 : -8));
+  }
+  fctx.restore();
+}
+
+function nodeBox(p, d, sub) {
+  const w = 172, h = 58, x = p.x - w / 2, y = p.y - h / 2;
+  fctx.save();
+  fctx.fillStyle = d.up ? "#101a28" : "#1c1116";
+  fctx.strokeStyle = d.up ? "#2c3f55" : "#7f1d1d";
+  fctx.lineWidth = 1.5;
+  rrect(fctx, x, y, w, h, 10);
+  fctx.fill();
+  fctx.stroke();
+  fctx.fillStyle = d.up ? "#22c55e" : "#ef4444";
+  fctx.beginPath();
+  fctx.arc(x + 15, p.y - 10, 4, 0, 7);
+  fctx.fill();
+  fctx.fillStyle = "#e5e7eb";
+  fctx.font = "600 13px ui-sans-serif, system-ui";
+  fctx.textAlign = "left";
+  fctx.fillText(d.name, x + 27, p.y - 6);
+  fctx.fillStyle = "#7d8b9c";
+  fctx.font = "10.5px ui-monospace, monospace";
+  fctx.fillText(d.up ? sub : "unreachable", x + 13, p.y + 16);
+  fctx.restore();
+}
+
+function renderFabric(ups, tgs, now) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = fabric.clientWidth, H = fabric.clientHeight;
+  if (fabric.width !== Math.round(W * dpr)) { fabric.width = Math.round(W * dpr); fabric.height = Math.round(H * dpr); }
+  fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  fctx.clearRect(0, 0, W, H);
+  if (!ups.length && !tgs.length) {
+    fctx.fillStyle = "#7d8b9c";
+    fctx.font = "13px ui-sans-serif";
+    fctx.textAlign = "center";
+    fctx.fillText("no endpoints configured", W / 2, H / 2);
+    return;
+  }
+  const py = 78, ty = H - 78;
+  const upP = place(ups.length, py, W, H).map((p, i) => ({ ...p, d: ups[i] }));
+  const tgP = place(tgs.length, ty, W, H).map((p, i) => ({ ...p, d: tgs[i] }));
+
+  const peerCount = Math.max(1, upP.length - 1);
+  // East-west N9 edges between UPF nodes (measured N9 tx, split over peers).
+  upP.forEach((a, i) => upP.forEach((b, j) => {
+    if (i >= j) return;
+    const pab = (a.d.up ? a.d.rates.N9_txPkts : 0) / peerCount;
+    const pba = (b.d.up ? b.d.rates.N9_txPkts : 0) / peerCount;
+    curveEdge(a, b, pab, COL.N9, 34, now);
+    curveEdge(b, a, pba, COL.N9, -34, now);
+  }));
+  // North-south edges: traffic gen -> UPF, colored by ingress interface.
+  tgP.forEach(tg => {
+    upP.forEach(up => {
+      if (!tg.d.up || !up.d.up) return;
+      const n = Math.max(1, tgs.length);
+      curveEdge(tg, up, (up.d.rates.N3_rxPkts) / n, COL.N3, 0, now);
+      curveEdge(tg, up, (up.d.rates.N5_rxPkts) / n, COL.N5, 0, now);
+    });
+  });
+
+  upP.forEach(p => nodeBox(p, p.d,
+    "N3 " + fmt(p.d.rates.N3_rxPkts) + "  N5 " + fmt(p.d.rates.N5_rxPkts) +
+    "  N9 " + fmt(p.d.rates.N9_txPkts) + " pps"));
+  tgP.forEach(p => nodeBox(p, p.d,
+    "TX " + fmt(p.d.rates.TX_txPkts) + " pps  " + fmt(p.d.flows.length) + " flows"));
+}
+
+function renderChart() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = chart.clientWidth, H = chart.clientHeight;
+  if (chart.width !== Math.round(W * dpr)) { chart.width = Math.round(W * dpr); chart.height = Math.round(H * dpr); }
+  cctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cctx.clearRect(0, 0, W, H);
+  if (history.length < 2) return;
+  const max = Math.max(1, ...history.map(h => h.total));
+  cctx.beginPath();
+  history.forEach((h, i) => {
+    const x = W - (history.length - 1 - i) * (W / 149);
+    const y = H - 6 - (h.total / max) * (H - 16);
+    i ? cctx.lineTo(x, y) : cctx.moveTo(x, y);
+  });
+  cctx.strokeStyle = "#38bdf8";
+  cctx.lineWidth = 1.6;
+  cctx.stroke();
+  cctx.lineTo(W, H);
+  cctx.lineTo(0, H);
+  cctx.closePath();
+  cctx.fillStyle = "rgba(56,189,248,.09)";
+  cctx.fill();
+  cctx.fillStyle = "#7d8b9c";
+  cctx.font = "10px ui-monospace, monospace";
+  cctx.textAlign = "left";
+  cctx.fillText("peak " + fmt(max) + " pps  (last " + history.length + " polls)", 6, 12);
+}
+
+function podCard(d, kind) {
+  const dot = '<span class="dot ' + (d.up ? "ok" : "down") + '"></span>';
+  if (kind === "upf") {
+    const cls = i => i === "N3" ? "c3" : i === "N5" ? "c5" : "c9";
+    const ifc = i => {
+      const f = d.ifs[i] || {};
+      return '<div class="ifc"><div class="t ' + cls(i) + '">' + i + '</div>' +
+        '<div class="row"><span class="mut">rx</span><b>' + fmt(d.rates[i + "_rxPkts"]) + "/s</b></div>" +
+        '<div class="row"><span class="mut">tx</span><b>' + fmt(d.rates[i + "_txPkts"]) + "/s</b></div>" +
+        '<div class="row"><span class="mut">pkts</span><b class="mut">' + fmt((f.rxPkts || 0) + (f.txPkts || 0)) + '</b></div>' +
+        '<div class="row"><span class="mut">enc/dec</span><b class="mut">' + fmt(f.encaps || 0) + "/" + fmt(f.decaps || 0) + '</b></div>' +
+        '<div class="row"><span class="mut">drop</span><b class="mut">' + fmt(f.dropped || 0) + '</b></div></div>';
+    };
+    return '<div class="card pod"><div class="head">' + dot + '<span class="name">' + d.name +
+      '</span><span class="url">' + d.url + '</span></div>' +
+      '<div class="ifaces" style="grid-template-columns:1fr 1fr 1fr">' +
+      ["N3", "N5", "N9"].map(ifc).join("") + '</div></div>';
+  }
+  return '<div class="card pod"><div class="head">' + dot + '<span class="name">' + d.name +
+    '</span><span class="url">' + d.url + '</span></div>' +
+    '<div class="ifaces" style="grid-template-columns:1fr"><div class="ifc">' +
+    '<div class="t c3">TX</div>' +
+    '<div class="row"><span class="mut">sent</span><b>' + fmt(d.rates.TX_txPkts) + "/s</b></div>" +
+    '<div class="row"><span class="mut">bw</span><b>' + fmt(d.rates.TX_txBytes) + "/s</b></div>" +
+    '<div class="row"><span class="mut">flows</span><b class="mut">' + d.flows.length + '</b></div>' +
+    '</div></div></div>';
+}
+
+function renderPods(ups, tgs) {
+  document.getElementById("pods").innerHTML =
+    ups.map(d => podCard(d, "upf")).join("") + tgs.map(d => podCard(d, "tg")).join("");
+}
+
+function renderTotals(total, ups, tgs) {
+  let h = '<div>Total ingest <b>' + fmt(total) + ' pps</b></div>';
+  ups.forEach(d => {
+    const n = d.rates.N3_rxPkts + d.rates.N5_rxPkts + d.rates.N9_rxPkts;
+    h += '<div class="mut">' + d.name + ': ' + fmt(n) + ' pps' +
+      ' <span class="mut">(N3 ' + fmt(d.rates.N3_rxPkts) + ' &middot; N5 ' + fmt(d.rates.N5_rxPkts) +
+      ' &middot; N9 ' + fmt(d.rates.N9_rxPkts) + ')</span></div>';
+  });
+  tgs.forEach(d => {
+    h += '<div class="mut">' + d.name + ' tx: ' + fmt(d.rates.TX_txPkts) + ' pps</div>';
+  });
+  document.getElementById("totals").innerHTML = h;
+}
+
+function renderTable(ups) {
+  let html = "";
+  ups.forEach(d => ["N3", "N5", "N9"].forEach(i => {
+    const f = d.ifs[i] || {};
+    html += '<tr><td>' + d.name + '</td><td>' + i + '</td>' +
+      '<td>' + fmt(d.rates[i + "_rxPkts"]) + '</td>' +
+      '<td>' + fmt(d.rates[i + "_txPkts"]) + '</td>' +
+      '<td>' + fmt(d.rates[i + "_txBytes"]) + '</td>' +
+      '<td>' + fmt(f.rxPkts || 0) + '</td><td>' + fmt(f.txPkts || 0) + '</td>' +
+      '<td>' + fmt(f.encaps || 0) + '</td><td>' + fmt(f.decaps || 0) + '</td>' +
+      '<td>' + fmt(f.dropped || 0) + '</td></tr>';
+  }));
+  document.getElementById("rows").innerHTML = html ||
+    '<tr><td colspan="10" class="mut">no data yet</td></tr>';
+}
+
+function setStatus(text, live) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = "badge" + (live ? " live" : "");
+}
+
+async function poll() {
+  let r;
+  try {
+    const resp = await fetch("/api/stats", { cache: "no-store" });
+    r = await resp.json();
+  } catch (e) {
+    setStatus("aggregator unreachable", false);
+    return;
+  }
+  setStatus("live &middot; " + r.latencyMs + "ms", true);
+
+  last = {
+    up: (r.upfs || []).map(u => ({
+      name: u.name, url: u.url, up: u.up,
+      ts: (u.data && u.data.ts) || r.ts,
+      ifs: ifacemap(u.data), flows: []
+    })),
+    tg: (r.tgs || []).map(u => ({
+      name: u.name, url: u.url, up: u.up,
+      ts: (u.data && u.data.ts) || r.ts,
+      ifs: ifacemap(u.data), flows: u.flows || []
+    }))
+  };
+  last.up.forEach(d => { d.rates = d.up ? rates(d, ["N3", "N5", "N9"]) : { N3_rxPkts: 0, N5_rxPkts: 0, N9_rxPkts: 0, N9_txPkts: 0 }; });
+  last.tg.forEach(d => { d.rates = d.up ? rates(d, ["TX"]) : { TX_txPkts: 0, TX_txBytes: 0 }; });
+
+  const total = last.up.reduce((s, d) => s + d.rates.N3_rxPkts + d.rates.N5_rxPkts + d.rates.N9_rxPkts, 0);
+  history.push({ total });
+  if (history.length > 150) history.shift();
+
+  const now = Date.now();
+  renderFabric(last.up, last.tg, now);
+  renderChart();
+  renderTotals(total, last.up, last.tg);
+  renderPods(last.up, last.tg);
+  renderTable(last.up);
+}
+
+window.addEventListener("resize", () => {
+  if (last) renderFabric(last.up, last.tg, Date.now());
+  renderChart();
+});
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
