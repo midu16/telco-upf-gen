@@ -32,8 +32,6 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
         securityContextConstraints:
           name: upf-udp
       terminationGracePeriodSeconds: 10

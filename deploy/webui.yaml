@@ -26,8 +26,6 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
         securityContextConstraints:
           name: upf-udp
       containers:
@@ -45,8 +43,8 @@ spec:
                 upf-1=http://upf-1.upf-hs.telco.svc.cluster.local:8080
             - name: TG_ENDPOINTS
               value: >-
-                tg-0=http://tg-0.tg-hs.telco.svc.cluster.local:8080,
-                tg-1=http://tg-1.tg-hs.telco.svc.cluster.local:8080
+                tg-0=http://trafficgen-0.tg-hs.telco.svc.cluster.local:8080,
+                tg-1=http://trafficgen-1.tg-hs.telco.svc.cluster.local:8080
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2
