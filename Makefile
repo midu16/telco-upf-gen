@@ -15,7 +15,8 @@
 #   TAG [latest]             image tag
 #   PLATFORMS [native]       "linux/amd64,linux/arm64" for multi-arch
 #   COMPONENTS [upf trafficgen webui]  images to build/push
-#   DB_IMAGE [registry.redhat.io/rhel9/postgresql:16]
+#   DB_IMAGE [registry.redhat.io/rhel9/postgresql-16:latest]
+#   DB_AUTHFILE [~/.docker/config.json]  # authfile for the local DB pull
 #   UPF_NODES [2]  TG replicas [2]
 #
 PODMAN  ?= podman
@@ -33,7 +34,11 @@ IMAGE          := $(IMAGE_REGISTRY)/$(IMAGE_OWNER)
 TAG            ?= latest
 PLATFORMS      ?=
 COMPONENTS     ?= upf trafficgen webui
-DB_IMAGE       ?= registry.redhat.io/rhel9/postgresql:16
+DB_IMAGE       ?= registry.redhat.io/rhel9/postgresql-16:latest
+# Auth file the local podman pull should use for DB_IMAGE (register.redhat.io
+# needs a Red Hat credential; the cluster pull secret works too).
+#   make test-local DB_AUTHFILE=/var/apps/sno.…/workdir/auth/pull-secret.json
+DB_AUTHFILE    ?= $(HOME)/.docker/config.json
 
 LOCAL_NET     ?= upfgen-local
 LOCAL_WEBUI   ?= 127.0.0.1:3080:8080
@@ -41,7 +46,8 @@ LOCAL_TG      ?= 127.0.0.1:3081:8080
 LOCAL_UPF_N3  ?= 127.0.0.1:2152:2152/udp
 LOCAL_UPF_N5  ?= 127.0.0.1:2153:2153/udp
 LOCAL_DB      ?= 127.0.0.1:15432:5432
-DB_USER       ?= postgres
+# NB: "postgres" is a built-in role in the RHEL PostgreSQL image.
+DB_USER       ?= upfgen
 DB_PASSWORD   ?= postgres
 DB_NAME       ?= telco_upf
 
@@ -190,7 +196,11 @@ push:
 test-local: images
 	@echo "==> local network"
 	@$(PODMAN) network exists $(LOCAL_NET) 2>/dev/null || $(PODMAN) network create $(LOCAL_NET)
-	@echo "==> db (requires 'podman login registry.redhat.io' for the RHEL9 image)"
+	@echo "==> db (set DB_AUTHFILE if the RHEL9 image needs credentials)"
+	@if ! $(PODMAN) image exists $(DB_IMAGE); then \
+		echo "==> pulling $(DB_IMAGE)"; \
+		$(PODMAN) pull --authfile $(DB_AUTHFILE) $(DB_IMAGE); \
+	fi
 	@$(PODMAN) rm -f upfgen-db >/dev/null 2>&1 || true
 	@$(PODMAN) run -d --name upfgen-db --network $(LOCAL_NET) --network-alias db \
 		-p $(LOCAL_DB) \
@@ -212,9 +222,11 @@ test-local: images
 	@echo "==> trafficgen-0"
 	@$(PODMAN) rm -f upfgen-tg-0 >/dev/null 2>&1 || true
 	@$(PODMAN) run -d --name upfgen-tg-0 --network $(LOCAL_NET) \
+		--network-alias trafficgen-0 \
 		-p $(LOCAL_TG) \
-		-e POD_NAME=trafficgen-0 -e TG_CONFIG=/etc/tg/trafficgen.yaml \
-		--mount type=bind,source=$(CURDIR)/local/trafficgen-local.yaml,destination=/etc/tg/trafficgen.yaml,readonly \
+		-e POD_NAME=trafficgen-0 \
+		-e UPF_PEER_DNS='upf-{n}' -e UPF_NODES=2 -e UPF_METRICS_PORT=8080 \
+		-e TG_PPS=100 -e TG_THROTTLE=100 -e TG_MAX_SESSIONS=32 \
 		$(IMAGE)/trafficgen:$(TAG)
 	@echo "==> webui"
 	@$(PODMAN) rm -f upfgen-webui >/dev/null 2>&1 || true

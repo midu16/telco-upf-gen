@@ -57,7 +57,7 @@ func main() {
 	e := &e2e{
 		ctx:    ctx,
 		ns:     ns,
-		dbUser: envOr("E2E_DB_USER", "postgres"),
+		dbUser: envOr("E2E_DB_USER", "upfgen"),
 		dbPass: envOr("E2E_DB_PASSWORD", "postgres"),
 		dbName: envOr("E2E_DB_NAME", "telco_upf"),
 	}
