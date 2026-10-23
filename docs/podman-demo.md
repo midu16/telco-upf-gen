@@ -60,7 +60,7 @@ N9 peer discovery and for the Web UI endpoints.
 | Requirement | Note |
 |---|---|
 | podman ≥ 4 | used: 5.8.7 |
-| images | `quay.io/midu/{upf,trafficgen,webui}:latest` (local after `build_and_push.sh`, or pulled) |
+| images | `quay.io/midu/{upf,trafficgen,webui}:latest` (local after `make build push`, or pulled) |
 | capabilities | `NET_BIND_SERVICE` per UPF/TG container — the non-root images bind GTP-U ports 2152–2154 (<1024). This is exactly what the OpenShift `upf-udp` SCC grants. |
 | host ports | 18080/18081 (UPF metrics), 18090/18091 (TG metrics), 18082 (dashboard) |
 
@@ -73,8 +73,8 @@ podman images --format '{{.Repository}}:{{.Tag}}   {{.Size}}' \
 
 ![step 00](img/step00-images.png)
 
-*Proof:* all three distroless images exist locally (built & pushed by
-`build_and_push.sh`), so `podman run` below starts them without re-pulling.
+*Proof:* all three images exist locally (built & pushed by `make build push`),
+so `podman run` below starts them without re-pulling.
 
 ## Step 01 — isolated podman network
 

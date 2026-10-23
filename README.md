@@ -1,115 +1,151 @@
 # telco-upf-gen
 
-Distributed 5G UPF (User Plane Function) **simulator** for OpenShift.
-Native GTP-U (3GPP TS 29.281 / RFC 8180) encapsulation/decapsulation across
-simulated **N3**, **N5** (DN) and **N9** (inter-UPF) interfaces, a dedicated
-traffic generator, and a real-time Web UI that visualizes the packet flow
-between pods.
+A distributed **5G UPF (User Plane Function) simulator** for OpenShift.
+Native **GTP-U** (3GPP TS 29.281 / RFC 8180) encapsulation and decapsulation
+across simulated **N3** (UE/gNB), **N5** (data-network) and **N9** (inter-UPF)
+interfaces, deep packet inspection (SPI/DPI + policy), telco **usage**
+analytics (CDRs and a lawful-interception feed), an **RFC 2544-style** load
+generator (with a live 0–100 % throttle knob), and a real-time **Web UI**
+backed by **PostgreSQL**.
 
-## Architecture
+Everything is **environment-agnostic**: no cluster names, IPs or paths are
+hard-coded. All configuration flows from YAML, ConfigMaps and environment
+variables, and the whole build / push / deploy / test pipeline is driven by a
+single `Makefile`.
 
-```
-        N3 (gNB/UE)    N5 (DN)
- trafficgen-0 ──GTP-U──► upf-0 ◄══════ N9 ═══════► upf-1 ◄──GTP-U── trafficgen-1
-                                   │ decap → plain IP
-                                   ▼
-                            DN target (optional)
+> **Architecture deep-dive:** see [`docs/architecture.md`](docs/architecture.md)
+> — every diagram in this repo is authored in native **Mermaid** (no external
+> images).
 
- webui ──fan-out──► /metrics + /api/flows on every pod
-```
+---
 
-* **`upf`** — one pod per node, StatefulSet (2). Listens for GTP-U on
-  N3/N5/N9, resolves F-TEIDs, forwards user payloads across the fabric.
-  Deterministic F-TEID scheme, **no control plane**:
-  `namespace<<24 | node<<16 | session<<0`.
-  Packets whose F-TEID names a *different* node are retagged into the N9
-  namespace and crossed to that peer — that is the east-west path.
-* **`trafficgen`** — one pod per replica (2). Discovers UPFs via `/api/teids`,
-  streams token-bucket flows: anchored N3 uplink, anchored N5 downlink,
-  east-west via N3 ingress / N5 ingress / direct N9.
-* **`webui`** — fans out to every pod's `/metrics` (+`/api/flows` on TGs),
-  renders animated N3/N5/N9 fabric view, per-interface pps, encaps/decaps,
-  drops, aggregate chart.
+## System overview
 
-## Wire format (G-PDU)
+```mermaid
+flowchart LR
+  subgraph FABRIC["User plane (StatefulSet, N pods)"]
+    U0["upf-0\nN3 · N5 · N9"]
+    U1["upf-1\nN3 · N5 · N9"]
+  end
+  TG["trafficgen (xN)\nGTP-U source · RFC 2544"]
+  WUI["webui\ndashboard · persistence bridge"]
+  DB[("PostgreSQL 16\nmetrics · DPI · CDR · LI · state")]
+  EXT["external load machine\nbin/trafficgen (dual-mode)"]
 
-```
-octet 0  : 0x30   VER=001 GTPv1, T/U=1 user plane (S flag if seq ext present)
-octet 1  : 0xFF   G-PDU
-octet 2-3: payload length (BE)
-octet 4-7: F-TEID (BE)
-octet 8+ : [6-octet sequence-number ext, alternating] + IPv4 datagram
-```
-
-## Layout
-
-```
-cmd/upf  cmd/trafficgen  cmd/webui       entrypoints
-internal/gtpu            GTP-U codec (+tests)
-internal/upf             session table, forwarding engine (+tests)
-internal/traffic         token-bucket flows, synthetic IPv4
-internal/telemetry       lock-free counters + JSON snapshots
-internal/web             aggregation API + embedded dashboard
-deploy/                  OpenShift manifests
-upf.Containerfile  trafficgen.Containerfile  webui.Containerfile
-build_and_push.sh        Podman build/push → quay.io/midu/*
-.github/workflows/build-and-push.yml   CI: multi-arch on push to main
+  TG -- "GTP-U (UDP)" --> U0 & U1
+  U0 <== "N9 inter-UPF" ==> U1
+  EXT -. "NodePort / LB ingress" .-> U0
+  WUI -- "poll /metrics · /api/*" --> U0 & U1
+  WUI -- "POST /api/throttle" --> TG
+  WUI == "batch upsert" ==> DB
 ```
 
-## Build & push (local, Podman)
+| Component | Role |
+|---|---|
+| **UPF** (`cmd/upf`) | The data plane. StatefulSet pod per node; decodes F-TEIDs, inspects every packet (SPI/DPI/policy), accounts usage, and forwards across the fabric over N9. |
+| **Traffic generator** (`cmd/trafficgen`) | Token-bucket GTP-U flows with realistic mock payloads (HTTP/SNI/DNS/QUIC). Dual-mode: in-cluster *or* external machine. Live 0–100 % throttle; RFC 2544 benchmarking (throughput, latency, loss, back-to-back). |
+| **Web UI** (`cmd/webui`) | Live dashboard; the **sole** PostgreSQL writer (metrics, SPI/DPI, CDRs, LI, UI state). State restored from the DB on refresh — zero data loss. |
+| **Database** (PostgreSQL 16) | Durable store for all analytics and UI state, on a PVC. |
+
+The data plane never touches the database — reports flow `UPF → webui → DB`,
+so a database outage can delay *reporting* but never stalls *forwarding*.
+
+---
+
+## Quick start
 
 ```bash
-export QUAY_PASSWORD=***                # username defaults to midu
-./build_and_push.sh                                      # native arch
-PLATFORMS=linux/amd64,linux/arm64 ./build_and_push.sh    # multi-arch manifest
-COMPONENTS=upf ./build_and_push.sh                       # subset
-```
-
-## CI (GitHub Actions)
-
-`.github/workflows/build-and-push.yml` runs on every push to `main`:
-
-1. `test` — `go vet` + `go test ./...`
-2. `build-push` — buildx + QEMU, `linux/amd64,linux/arm64` per image,
-   pushed to `quay.io/midu/{upf,trafficgen,webui}:latest` (GHA build cache).
-
-Repo secrets required: `QUAY_USERNAME` (can be blank → defaults to `midu`
-owner `midu`) and `QUAY_PASSWORD` (a Quay robot token or password).
-
-## Deploy (OpenShift / SNO)
-
-```bash
-# 1. images (either CI after push to main, or locally)
+# one-time: credentials + cluster access
 export QUAY_PASSWORD=***
-./build_and_push.sh
+export KUBECONFIG=/path/to/kubeconfig      # e.g. your SNO admin kubeconfig
 
-# 2. manifests (order matters: ns → scc → workloads)
-oc apply -f deploy/namespace.yaml
-oc apply -f deploy/scc.yaml          # SCC "upf-udp": non-root + NET_BIND_SERVICE
-oc apply -f deploy/upf.yaml          # StatefulSet(2) + headless svc upf-hs
-oc apply -f deploy/trafficgen.yaml   # StatefulSet(2) + headless svc tg-hs
-oc apply -f deploy/webui.yaml        # Deployment + Service + Route
-
-oc -n telco get pods -w
-oc -n telco get route webui          # dashboard URL
+make                # menu of all targets
+make build          # Go binaries + UBI9 Podman images
+make push           # login to Quay (QUAY_USERNAME/QUAY_PASSWORD) + push
+make deploy         # oc apply -f deploy/ against $KUBECONFIG
+make e2e            # live-cluster end-to-end suite
 ```
 
-Dashboard shows: animated fabric (N3 blue gNB↔UPF, N5 green DN↔UPF,
-N9 orange UPF↔UPF, edge width ∝ live pps), aggregate ingest chart,
-per-pod per-interface cards (rx/tx pps, pkts, encap/decap, drops)
-and a full interface table.
+Useful local-only flows:
 
-**SCC note:** the plane uses plain UDP sockets (no AF_PACKET/raw), so the
-`upf-udp` SCC only adds non-root + `NET_BIND_SERVICE` (GTP-U data ports
-2152–2154 are <1024). No privileged SCC, no host namespaces.
+```bash
+make test           # go test ./... (unit + integration)
+make lint           # gofmt check + go vet (+ staticcheck when installed)
+make test-local     # full stack under podman (UPF + TG + webui + Postgres)
+make local-logs     # tail everything
+make local-down     # tear down the local stack
+```
 
-To observe decapped plain-IP egress, set `DN_TARGET` in `deploy/upf.yaml`
-to a reachable UDP sink.
+### Required environment variables
 
-## Verification status
+| Variable | Consumed by | Purpose |
+|---|---|---|
+| `QUAY_USERNAME` | `make push` | Quay user (default `midu`, override: `make push IMAGE_OWNER=you`) |
+| `QUAY_PASSWORD` | `make push` / `make login` | Quay token or password (never stored; temp authfile) |
+| `KUBECONFIG` | `make deploy` / `e2e` / `pods` / `undeploy` | kubeconfig of the target cluster |
+| `NAMESPACE` (opt) | deploy / e2e | OpenShift namespace (default `telco`) |
+| `IMAGE_REGISTRY` / `IMAGE_OWNER` / `TAG` (opt) | build / push | image reference parts |
+| `PLATFORMS` (opt) | build / push | e.g. `linux/amd64,linux/arm64` for a multi-arch manifest |
+| `COMPONENTS` (opt) | build / push / images | subset, e.g. `upf trafficgen` |
 
-* unit: GTP-U codec byte-exact; F-TEID math; in-process 2-node fabric test
-  (N3→N9 retag EW, N9 direct, local anchor, bad-NS/unknown-session/garbage drops)
-* integration: 3-process local run (UPF+TG+webui) at ~10 kpps, zero drops
-* image: built with podman, container smoke-tested non-root (healthz,
-  /api/teids, UDP 2152–2154 bound)
+---
+
+## The traffic fabric in one picture
+
+Each node is a stateless UPF: session identity is encoded into the F-TEID
+(`namespace<<24 | node<<16 | seq`), so any node can route a packet without a
+control plane. Packets anchored on a *peer* node are retagged into the N9
+namespace and crossed the fabric.
+
+```mermaid
+sequenceDiagram
+  participant TG as trafficgen
+  participant A as upf-0
+  participant B as upf-1
+  Note over TG,B: east-west session (anchored on upf-1)
+  TG->>A: G-PDU on N3 (ns=N3 node=1 seq=42)
+  A->>A: SPI + DPI + policy + CDR accounting
+  A->>B: retag ns→N9, forward over N9
+  B->>B: deliver locally (no re-inspection)
+  Note over TG,B: each packet is accounted exactly once
+```
+
+The traffic generator emits anchored N3 (uplink), anchored N5 (downlink) and
+all three east-west shapes, so every forwarding branch runs continuously.
+Inner payloads are wire-valid IPv4/TCP/UDP with real checksums, each flow
+emulating HTTP, HTTPS (ClientHello with SNI), DNS, QUIC or plain UDP — so the
+DPI dashboard shows genuine app classification.
+
+---
+
+## Usage analytics
+
+* **CDRs** — per-session billing records (UL/DL packets & bytes, per-app
+  breakdown, duration), closed after an idle window and upserted
+  idempotently into Postgres.
+* **Lawful-interception feed** — per-packet header records for a configurable
+  session selector, bounded by a ring.
+* **Policy events** — every `observe`/`drop` decision with rule + 5-tuple.
+* **Metrics** — per-`(pod, iface)` counters and rates at a fixed cadence.
+
+All of it is browsable in the Web UI, and every widget re-reads from the
+database on refresh.
+
+---
+
+## Repository layout
+
+```
+cmd/            upf · trafficgen · webui · e2e          (entrypoints)
+internal/       gtpu · upf · dpi · usage · traffic      (data plane + codecs)
+                telemetry · web · dbstore               (metrics, UI, store)
+deploy/         OpenShift manifests (namespace, SCC, STS, Deployments,
+                Services, Route, PVC, ConfigMaps)
+local/          example YAML (local TG, external TG, policy profile)
+docs/           architecture.md (Mermaid) + notes
+makefile        all podman + oc automation   (*.Containerfile: UBI9 per component)
+```
+
+Full package-by-package notes, the data-plane pipeline, the DB schema (er
+diagram) and the RFC 2544 design live in
+[`docs/architecture.md`](docs/architecture.md).
