@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/midu/telco-upf-gen/internal/dpi"
@@ -52,10 +54,12 @@ type UPF struct {
 	engine   *dpi.Engine
 	ledger   *usage.Ledger
 
-	mu    sync.Mutex
-	conns map[string]*net.UDPConn // per-destination egress tunnels
-	dn    *net.UDPConn
-	cache map[uint8]*net.UDPAddr // N9 peer address cache
+	mu       sync.Mutex
+	conns    map[string]*net.UDPConn // per-destination egress tunnels
+	dn       *net.UDPConn
+	dnKey    string                 // DN target the cached dn socket points at
+	dnTarget atomic.Pointer[string] // runtime DN egress target ("host:port", "" = count only)
+	cache    map[uint8]*net.UDPAddr // N9 peer address cache
 }
 
 // New builds the node (listeners are started by Run).
@@ -82,6 +86,7 @@ func New(cfg Config) *UPF {
 		conns:    map[string]*net.UDPConn{},
 		cache:    map[uint8]*net.UDPAddr{},
 	}
+	u.dnTarget.Store(&cfg.DNTarget)
 	if cfg.Inspection {
 		policy, err := dpi.LoadPolicy(cfg.PolicyPath)
 		if err != nil {
@@ -168,18 +173,27 @@ func (u *UPF) connTo(dst *net.UDPAddr) (*net.UDPConn, error) {
 	return c, nil
 }
 
+// dnConn returns the cached DN egress socket, dialing (or re-dialing after
+// a target switch) as needed.
 func (u *UPF) dnConn() (*net.UDPConn, error) {
-	if u.cfg.DNTarget == "" {
-		return nil, errors.New("upf: no DN target configured")
-	}
+	target := *u.dnTarget.Load()
+
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.dn != nil {
+	if u.dnKey == target && u.dn != nil {
 		return u.dn, nil
 	}
-	host, port, err := net.SplitHostPort(u.cfg.DNTarget)
+	if u.dn != nil { // stale socket after a SetDNTarget switch
+		_ = u.dn.Close()
+		u.dn = nil
+		u.dnKey = ""
+	}
+	if target == "" {
+		return nil, errors.New("upf: no DN target configured")
+	}
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
-		return nil, fmt.Errorf("upf: bad DN target %q: %w", u.cfg.DNTarget, err)
+		return nil, fmt.Errorf("upf: bad DN target %q: %w", target, err)
 	}
 	ip, err := net.LookupIP(host)
 	if err != nil {
@@ -187,15 +201,48 @@ func (u *UPF) dnConn() (*net.UDPConn, error) {
 	}
 	pn, err := strconv.Atoi(port)
 	if err != nil {
-		return nil, fmt.Errorf("upf: bad DN port in %q: %w", u.cfg.DNTarget, err)
+		return nil, fmt.Errorf("upf: bad DN port in %q: %w", target, err)
 	}
 	c, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip[0], Port: pn})
 	if err != nil {
 		return nil, err
 	}
 	u.dn = c
+	u.dnKey = target
 	return c, nil
 }
+
+// SetDNTarget switches the plain-IP DN egress target ("host:port") at
+// runtime; empty reverts to count-only mode. Safe against the forwarding
+// hot path: the cached socket is dropped and re-dialed lazily.
+func (u *UPF) SetDNTarget(target string) error {
+	if target != "" {
+		host, port, err := net.SplitHostPort(target)
+		if err != nil || host == "" {
+			return fmt.Errorf("upf: bad DN target %q (want host:port)", target)
+		}
+		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("upf: bad DN port in %q", target)
+		}
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.dnKey == target && (u.dn != nil || target == "") {
+		u.dnTarget.Store(&target)
+		return nil
+	}
+	if u.dn != nil {
+		_ = u.dn.Close()
+		u.dn = nil
+		u.dnKey = ""
+	}
+	u.dnTarget.Store(&target)
+	return nil
+}
+
+// DNTarget is the current runtime DN egress target ("host:port"; empty =
+// count only).
+func (u *UPF) DNTarget() string { return *u.dnTarget.Load() }
 
 type job struct {
 	buf   []byte
@@ -440,7 +487,7 @@ func (u *UPF) deliverDN(payload []byte) {
 	n5.Decapsulated.Add(1)
 	n5.TxPackets.Add(1)
 	n5.TxBytes.Add(uint64(len(payload)))
-	if u.cfg.DNTarget == "" {
+	if u.DNTarget() == "" {
 		return
 	}
 	c, err := u.dnConn()
@@ -499,6 +546,36 @@ func (u *UPF) Handler() http.Handler {
 	mux.HandleFunc("/api/teids", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(u.Teids())
+	})
+	// Runtime DN-egress switch, used by the traffic generator's RFC 2544
+	// bench to point the DN target at its own sink for a measurement run.
+	mux.HandleFunc("/api/dn-target", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]string{"target": u.DNTarget()})
+		case http.MethodPost:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<10))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var req struct {
+				Target string `json:"target"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				http.Error(w, "expected {\"target\":\"host:port\" or \"\"}", http.StatusBadRequest)
+				return
+			}
+			if err := u.SetDNTarget(req.Target); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			log.Printf("upf %s: DN target set to %q", u.cfg.NodeName, req.Target)
+			_ = json.NewEncoder(w).Encode(map[string]string{"target": u.DNTarget()})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 	mux.HandleFunc("/api/dpi", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

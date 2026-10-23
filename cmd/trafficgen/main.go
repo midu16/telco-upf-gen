@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,9 @@ type fabricNode struct {
 	Node     int
 	Sessions int
 	Ports    map[string]int
+	// ControlURL is the node's control-lite HTTP base ("" = unreachable
+	// from this generator, e.g. external mode without upf[].control).
+	ControlURL string
 }
 
 func main() {
@@ -73,6 +77,7 @@ func main() {
 
 	gen := traffic.NewGenerator(cfg.Name, cfg.Interval)
 	count := buildFlows(gen, upfs, cfg)
+	bench := traffic.NewBench(gen, cfg.Bench)
 	log.Printf("trafficgen %s: %d flows against %d UPF node(s), ~%.0f pps aggregate at 100%%, throttle %.0f%%",
 		cfg.Name, count, len(upfs), float64(count)*cfg.PPS, gen.Throttle())
 
@@ -96,7 +101,7 @@ func main() {
 
 	go ppsLogger(ctx, gen)
 
-	srv := &http.Server{Addr: *metricsAddr, Handler: routes(gen), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: *metricsAddr, Handler: routes(gen, bench, upfs), ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("trafficgen %s: control HTTP on %s", cfg.Name, *metricsAddr)
 	if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
 		log.Fatalf("trafficgen: %v", err)
@@ -141,6 +146,7 @@ func loadResolvedConfig(cfgPath, name, peerDNS string, nodes, metricsPort int, p
 		rc.MaxSess = c.MaxSessions
 		rc.External = c.External()
 		rc.Ups = c.Ups
+		rc.Bench = c.Bench
 		if c.Discover != nil {
 			rc.DNS = c.Discover.DNS
 			rc.Nodes = c.Discover.Nodes
@@ -194,6 +200,7 @@ type resolvedConfig struct {
 	MetricsPort int
 	External    bool
 	Ups         []traffic.UpfSpec
+	Bench       traffic.BenchProfile
 }
 
 // resolveFabric returns the addressed UPF endpoints (discovered or explicit).
@@ -211,6 +218,7 @@ func resolveFabric(rc *resolvedConfig) ([]fabricNode, error) {
 					"n5": u.Ports.N5,
 					"n9": u.Ports.N9,
 				},
+				ControlURL: controlURL(u.Host, u.Control),
 			})
 		}
 		sort.Slice(out, func(a, b int) bool { return out[a].Node < out[b].Node })
@@ -219,6 +227,16 @@ func resolveFabric(rc *resolvedConfig) ([]fabricNode, error) {
 	return discover(rc)
 }
 
+func controlURL(host string, port int) string {
+	if port <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// buildFlows builds the normal traffic flows. Session `sessions-1` of each
+// node is reserved for the RFC 2544 bench session, so normal flows cap at
+// sessions-1 per node.
 func buildFlows(gen *traffic.Generator, upfs []fabricNode, rc *resolvedConfig) int {
 	nodes := len(upfs)
 	if nodes == 0 {
@@ -227,8 +245,8 @@ func buildFlows(gen *traffic.Generator, upfs []fabricNode, rc *resolvedConfig) i
 	count := 0
 	for _, info := range upfs {
 		m := rc.MaxSess
-		if info.Sessions > 0 && info.Sessions < m {
-			m = info.Sessions
+		if info.Sessions > 1 && info.Sessions-1 < m {
+			m = info.Sessions - 1 // reserve the top sequence for the bench
 		}
 		for s := 0; s < m; s++ {
 			seq := uint32(s)
@@ -311,7 +329,7 @@ func ppsLogger(ctx context.Context, gen *traffic.Generator) {
 	}
 }
 
-func routes(gen *traffic.Generator) http.Handler {
+func routes(gen *traffic.Generator, bench *traffic.Bench, upfs []fabricNode) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -347,7 +365,176 @@ func routes(gen *traffic.Generator) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("/api/rfc2544", rfc2544(bench, upfs))
+	mux.HandleFunc("/api/rfc2544/cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ok := bench.Cancel()
+		if ok {
+			log.Printf("trafficgen: rfc2544 run cancelled")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": ok})
+	})
 	return mux
+}
+
+// benchRequest selects profile overrides for one RFC 2544 run. Zero / empty
+// fields fall back to the configured defaults; node selects the anchor by
+// fabric identity (absent = first endpoint).
+type benchRequest struct {
+	FrameSizes     []int     `json:"frame_sizes"`
+	CandidateRates []float64 `json:"candidate_rates"`
+	LatencyRate    float64   `json:"latency_rate"`
+	MinRate        float64   `json:"min_rate"`
+	MaxRate        float64   `json:"max_rate"`
+	DurationMs     int       `json:"duration_ms"`
+	B2BSizes       []int     `json:"b2b_sizes"`
+	Tests          []string  `json:"tests"`
+	Node           *int      `json:"node"`
+}
+
+// rfc2544 exposes the benchmark control plane:
+//
+//	GET  /api/rfc2544[?lite=1]  -> {"status":…, "profile":…, "runs":[…]}
+//	POST /api/rfc2544           -> body: profile overrides + {"node":n}
+//	POST /api/rfc2544/cancel    -> stop the active run
+func rfc2544(bench *traffic.Bench, upfs []fabricNode) http.HandlerFunc {
+	client := &http.Client{Timeout: 5 * time.Second}
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.Query().Get("lite") == "1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":  bench.Status(),
+					"profile": bench.Profile(),
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":  bench.Status(),
+				"profile": bench.Profile(),
+				"runs":    bench.History(),
+			})
+		case http.MethodPost:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<10))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var req benchRequest
+			if len(bytes.TrimSpace(body)) > 0 {
+				if err := json.Unmarshal(body, &req); err != nil {
+					http.Error(w, "bad JSON body: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			p := bench.Profile()
+			if len(req.FrameSizes) > 0 {
+				p.FrameSizes = req.FrameSizes
+			}
+			if len(req.CandidateRates) > 0 {
+				p.CandidateRates = req.CandidateRates
+			}
+			if req.LatencyRate > 0 {
+				p.LatencyRate = req.LatencyRate
+			}
+			if req.MinRate > 0 {
+				p.MinRate = req.MinRate
+			}
+			if req.MaxRate > 0 {
+				p.MaxRate = req.MaxRate
+			}
+			if req.DurationMs > 0 {
+				p.DurationMs = req.DurationMs
+			}
+			if len(req.B2BSizes) > 0 {
+				p.B2BSizes = req.B2BSizes
+			}
+			if len(req.Tests) > 0 {
+				ts := make([]traffic.BenchTest, 0, len(req.Tests))
+				for _, t := range req.Tests {
+					ts = append(ts, traffic.BenchTest(strings.TrimSpace(t)))
+				}
+				p.Tests = ts
+			}
+
+			anchor, err := pickAnchor(upfs, req.Node)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if anchor.Ports["n3"] == 0 {
+				http.Error(w, fmt.Sprintf("anchor upf-%d (%s) offers no N3 port", anchor.Node, anchor.Host), http.StatusBadRequest)
+				return
+			}
+			if anchor.ControlURL == "" {
+				http.Error(w, "anchor UPF control endpoint not reachable from this generator (in-cluster: provided by discovery; external mode: set upf[].control)", http.StatusConflict)
+				return
+			}
+			ctrl := anchor.ControlURL
+			bench.SetDeps(traffic.BenchDeps{
+				SetDNTarget: func(target string) (string, error) {
+					return requestDNTarget(client, ctrl, target)
+				},
+			})
+			n3Addr := net.JoinHostPort(anchor.Host, strconv.Itoa(anchor.Ports["n3"]))
+			if err := bench.Start(p, n3Addr, anchor.Node, anchor.Sessions); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			log.Printf("trafficgen: rfc2544 run started (anchor upf-%d %s, sizes %v, tests %v)",
+				anchor.Node, n3Addr, p.FrameSizes, p.Tests)
+			_ = json.NewEncoder(w).Encode(map[string]any{"started": true, "status": bench.Status()})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// pickAnchor resolves the bench anchor endpoint from a node id.
+func pickAnchor(upfs []fabricNode, node *int) (fabricNode, error) {
+	if len(upfs) == 0 {
+		return fabricNode{}, fmt.Errorf("no UPF endpoints known")
+	}
+	if node == nil {
+		return upfs[0], nil
+	}
+	for _, fn := range upfs {
+		if fn.Node == *node {
+			return fn, nil
+		}
+	}
+	return fabricNode{}, fmt.Errorf("node %d not present in the fabric", *node)
+}
+
+// requestDNTarget GETs the UPF's current DN target and POSTs the new one,
+// returning the previous value for the bench to restore.
+func requestDNTarget(client *http.Client, ctrlURL, target string) (string, error) {
+	body, err := getJSON(client, ctrlURL+"/api/dn-target")
+	if err != nil {
+		return "", fmt.Errorf("read current DN target: %w", err)
+	}
+	var cur struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(body, &cur); err != nil {
+		return "", fmt.Errorf("parse current DN target: %w", err)
+	}
+	payload, _ := json.Marshal(map[string]string{"target": target})
+	resp, err := client.Post(ctrlURL+"/api/dn-target", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusConflict || resp.StatusCode >= 500 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("upf rejected DN target %q: status %d %s", target, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return cur.Target, nil
 }
 
 // parseThrottleBody accepts a bare number ("75") or JSON ({"throttle":75}).
@@ -400,7 +587,13 @@ func discover(rc *resolvedConfig) ([]fabricNode, error) {
 				continue
 			}
 			log.Printf("trafficgen: discovered %s (node %d, %d sessions)", info.Name, info.Node, info.Sessions)
-			infos = append(infos, fabricNode{Host: host, Node: info.Node, Sessions: info.Sessions, Ports: info.Ports})
+			infos = append(infos, fabricNode{
+				Host:       host,
+				Node:       info.Node,
+				Sessions:   info.Sessions,
+				Ports:      info.Ports,
+				ControlURL: fmt.Sprintf("http://%s:%d", host, rc.MetricsPort),
+			})
 		}
 		sort.Slice(infos, func(a, b int) bool { return infos[a].Node < infos[b].Node })
 		missing = still

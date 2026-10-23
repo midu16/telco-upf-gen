@@ -23,10 +23,18 @@ import (
 
 // UpfSpec is one explicit UPF endpoint (external mode).
 type UpfSpec struct {
-	Host     string   `yaml:"host"` // FQDN or IP
-	Node     int      `yaml:"node"` // node identity (0-255), maps into the F-TEID
-	Sessions int      `yaml:"sessions"`
-	Ports    UpfPorts `yaml:"ports"`
+	Host string `yaml:"host"` // FQDN or IP
+
+	Node int `yaml:"node"` // node identity (0-255), maps into the F-TEID
+	// Sessions is the node's session space as advertised by /api/teids
+	// (defaults to MaxSessions). The node's top sequence is reserved for the
+	// RFC 2544 bench session.
+	Sessions int `yaml:"sessions"`
+	// Control is the UPF's control-lite HTTP port on the same host (where
+	// /api/teids and /api/dn-target live). Required for the RFC 2544 bench
+	// in external mode; zero = bench unavailable on this node.
+	Control int      `yaml:"control"`
+	Ports   UpfPorts `yaml:"ports"`
 }
 
 // UpfPorts are the GTP-U data ports of one UPF endpoint. Zero = not offered.
@@ -53,6 +61,7 @@ type Config struct {
 	Ups         []UpfSpec     `yaml:"upf"`          // explicit endpoints (external mode)
 	Discover    *DiscoverSpec `yaml:"discover"`     // in-cluster discovery (nil = default)
 	Duration    string        `yaml:"duration"`     // "1h" / "" = run forever
+	Bench       BenchProfile  `yaml:"bench"`        // RFC 2544 benchmark profile defaults
 }
 
 // Defaults are applied after unmarshalling so a minimal file works.
