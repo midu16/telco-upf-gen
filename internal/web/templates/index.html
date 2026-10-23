@@ -9,30 +9,36 @@
   --bg:#0b0f14; --panel:#10161f; --panel2:#0d131b; --border:#1f2937;
   --text:#e5e7eb; --mut:#7d8b9c;
   --n3:#38bdf8; --n5:#34d399; --n9:#f59e0b; --ok:#22c55e; --down:#ef4444;
+  --accent:#38bdf8; --warn:#fbbf24; --li:#c4b5fd;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);
   font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:14px 22px;
+header{display:flex;align-items:center;gap:12px;padding:14px 22px;flex-wrap:wrap;
   border-bottom:1px solid var(--border);background:var(--panel2)}
 header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:1px}
 header .sub{color:var(--mut);font-size:12px}
-.badge{margin-left:auto;font-size:11px;padding:3px 10px;border-radius:999px;
+.badge{font-size:11px;padding:3px 10px;border-radius:999px;
   border:1px solid var(--border);color:var(--mut);white-space:nowrap}
 .badge.live{color:var(--ok);border-color:rgba(34,197,94,.45)}
-main{padding:18px 22px 40px;max-width:1440px;margin:0 auto}
+.badge.dbok{color:var(--accent);border-color:rgba(56,189,248,.4)}
+.badge.dbdown{color:var(--warn);border-color:rgba(251,191,36,.4)}
+header .right{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+main{padding:18px 22px 40px;max-width:1600px;margin:0 auto;display:grid;gap:16px}
 .card{background:var(--panel);border:1px solid var(--border);
-  border-radius:10px;padding:14px 16px}
+  border-radius:10px;padding:14px 16px;min-width:0}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
-  color:var(--mut);margin:0 0 12px}
+  color:var(--mut);margin:0 0 12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h2 .tag{font-size:10px;letter-spacing:.4px;text-transform:none;color:var(--mut);
+  border:1px solid var(--border);border-radius:999px;padding:2px 8px}
 #fabric{width:100%;height:330px;display:block}
 .legend{display:flex;gap:18px;margin-top:10px;font-size:12px;color:var(--mut);flex-wrap:wrap}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
-.cols{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-top:16px}
+.cols{display:grid;grid-template-columns:2fr 1fr;gap:16px;min-width:0}
 #chart{width:100%;height:110px;display:block}
 #totals{font-family:ui-monospace,Menlo,monospace;font-size:13px}
 #totals div{margin-top:4px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-top:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;min-width:0}
 .pod .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .dot{width:9px;height:9px;border-radius:50%;flex:none}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(34,197,94,.7)}
@@ -45,8 +51,9 @@ h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
 .ifc .t{font-size:11px;font-weight:700;letter-spacing:.5px}
 .ifc .c3{color:var(--n3)} .ifc .c5{color:var(--n5)} .ifc .c9{color:var(--n9)}
 .ifc .row{display:flex;justify-content:space-between;font-size:12px;margin-top:4px;
-  font-family:ui-monospace,Menlo,monospace}
+  font-family:ui-monospace,Menlo,monospace;gap:8px}
 .mut{color:var(--mut)}
+.twrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:12px;
   font-family:ui-monospace,Menlo,monospace}
 th,td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
@@ -54,14 +61,59 @@ th{color:var(--mut);font-weight:600;font-size:10px;text-transform:uppercase;lett
 th:first-child,td:first-child{text-align:left}
 th:nth-child(2),td:nth-child(2){text-align:left}
 tr:hover td{background:rgba(255,255,255,.02)}
-@media(max-width:1100px){.cols{grid-template-columns:1fr}}
+
+/* knob */
+.knobar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.knobar input[type=range]{flex:1 1 240px;min-width:160px;accent-color:var(--accent);height:22px}
+#knobv{font-family:ui-monospace,Menlo,monospace;font-size:20px;font-weight:700;color:var(--accent);min-width:64px;text-align:right}
+.knobmeta{margin-top:8px;font-size:11px;color:var(--mut)}
+
+/* rfc2544 */
+.rfcgrid{display:grid;grid-template-columns:minmax(300px,340px) minmax(0,1fr);gap:16px;align-items:start}
+fieldset{border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:0}
+legend{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);padding:0 6px}
+label.f{display:block;font-size:11px;color:var(--mut);margin-top:8px}
+label.f input{width:100%;margin-top:3px;background:var(--panel2);border:1px solid var(--border);
+  color:var(--text);border-radius:6px;padding:6px 8px;font:12px ui-monospace,monospace}
+label.f input:focus{outline:1px solid var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.chip{font-size:11px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;
+  color:var(--mut);cursor:pointer;user-select:none}
+.chip.on{color:var(--text);border-color:var(--accent);background:rgba(56,189,248,.12)}
+.actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+button{border:1px solid var(--border);border-radius:7px;background:var(--panel2);
+  color:var(--text);padding:8px 16px;font-size:13px;cursor:pointer}
+button.primary{border-color:var(--accent);color:var(--accent)}
+button.primary:hover:not(:disabled){background:rgba(56,189,248,.15)}
+button:disabled{opacity:.4;cursor:not-allowed}
+#benchstate{font-family:ui-monospace,monospace;font-size:12px;margin-top:12px;
+  border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--panel2)}
+.bar{height:6px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--n5));width:0%}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+.charts .card{min-height:180px}
+canvas.cv{width:100%;height:190px;display:block}
+.note{font-size:11px;color:var(--mut);margin-top:4px}
+
+.threer{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;min-width:0}
+.appname{font-weight:600}
+
+@media(max-width:1100px){.cols{grid-template-columns:1fr}.rfcgrid{grid-template-columns:1fr}}
+@media(max-width:640px){
+  main{padding:12px 10px 30px}header{padding:12px 12px}
+  .charts{grid-template-columns:1fr}
+  .pod .url{display:none}
+}
 </style>
 </head>
 <body>
 <header>
   <h1>5G UPF FABRIC</h1>
   <span class="sub">{{.UpfCount}} UPF &times; {{.TgCount}} TG &mdash; N3 / N5 / N9 GTP-U live view</span>
-  <span class="badge" id="status">connecting&hellip;</span>
+  <span class="right">
+    <span class="badge" id="db">db&hellip;</span>
+    <span class="badge" id="status">connecting&hellip;</span>
+  </span>
 </header>
 <main>
   <div class="card">
@@ -76,20 +128,104 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
   <div class="cols">
     <div class="card"><h2>Aggregate ingest (UPF side)</h2><canvas id="chart"></canvas></div>
-    <div class="card"><h2>This poll</h2><div id="totals">waiting for data&hellip;</div></div>
+    <div class="card">
+      <h2>This poll <span class="tag" id="dbnote"></span></h2>
+      <div id="totals">waiting for data&hellip;</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Traffic knob &mdash; manual output level <span class="tag">applied to every generator, persisted in the db</span></h2>
+    <div class="knobar">
+      <input type="range" id="knob" min="0" max="100" step="0.5" value="100" aria-label="traffic throttle percent">
+      <span id="knobv">100%</span>
+    </div>
+    <div class="knobmeta" id="knobmeta"></div>
   </div>
 
   <div class="grid" id="pods"></div>
 
-  <div class="card" style="margin-top:16px">
+  <div class="card">
     <h2>Interfaces</h2>
-    <table>
+    <div class="twrap"><table>
       <thead><tr>
         <th>pod</th><th>iface</th><th>rx pps</th><th>tx pps</th><th>tx B/s</th>
         <th>rx pkts</th><th>tx pkts</th><th>encap</th><th>decap</th><th>dropped</th>
       </tr></thead>
       <tbody id="rows"></tbody>
-    </table>
+    </table></div>
+  </div>
+
+  <div class="threer">
+    <div class="card">
+      <h2>SPI / DPI classification <span class="tag" id="dpinote"></span></h2>
+      <div class="twrap"><table>
+        <thead><tr><th>pod</th><th>app</th><th>dir</th><th>pkts</th><th>bytes</th><th>dropped</th></tr></thead>
+        <tbody id="dpirows"></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h2>CDRs (closed sessions)</h2>
+      <div class="twrap"><table>
+        <thead><tr><th>session</th><th>node</th><th>volume</th><th>duration</th><th>status</th></tr></thead>
+        <tbody id="cdrrows"></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h2>Policy &amp; LI events</h2>
+      <div class="twrap"><table>
+        <thead><tr><th>ts</th><th>pod</th><th>rule/app</th><th>action</th></tr></thead>
+        <tbody id="evrows"></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>RFC 2544 benchmark <span class="tag" id="benchtag">idle</span></h2>
+    <div class="rfcgrid">
+      <div>
+        <h2>Run setup</h2>
+        <div class="chips" id="tests">
+          <span class="chip on" data-t="loss">loss</span>
+          <span class="chip on" data-t="throughput">throughput</span>
+          <span class="chip on" data-t="latency">latency</span>
+          <span class="chip on" data-t="back2back">back-to-back</span>
+        </div>
+        <label class="f">Frame sizes (octets, comma-sep; 64&ndash;65000)
+          <input id="fsizes" placeholder="64, 256, 1518"></label>
+        <label class="f">Duration per measurement (ms, 250&ndash;10000)
+          <input id="durms" placeholder="2000"></label>
+        <label class="f">Throughput search window min/max (pps)
+          <input id="rates" placeholder="64, 250000"></label>
+        <label class="f">Latency rate (pps)
+          <input id="latrate" placeholder="64"></label>
+        <label class="f">Back-to-back burst sizes (frames)
+          <input id="b2bsizes" placeholder="256, 1024, 4096, 16384"></label>
+        <div class="actions">
+          <button class="primary" id="start">Start run</button>
+          <button id="cancel" disabled>Cancel</button>
+        </div>
+        <div id="benchstate">status: polling&hellip;</div>
+      </div>
+      <div class="charts">
+        <div class="card"><h2>Frame loss vs offered rate <span class="tag" id="t_loss"></span></h2>
+          <canvas class="cv" id="c_loss"></canvas><div class="note">each curve = one frame size; loss % on a log-rate axis</div></div>
+        <div class="card"><h2>Zero-loss throughput <span class="tag" id="t_tput"></span></h2>
+          <canvas class="cv" id="c_tput"></canvas><div class="note">maximum lossless offered rate per frame size (Mbps)</div></div>
+        <div class="card"><h2>One-way latency <span class="tag" id="t_lat"></span></h2>
+          <canvas class="cv" id="c_lat"></canvas><div class="note">min / avg / max per frame size (microseconds)</div></div>
+        <div class="card"><h2>Back-to-back burst <span class="tag" id="t_b2b"></span></h2>
+          <canvas class="cv" id="c_b2b"></canvas><div class="note">largest lossless unpaced burst per frame size</div></div>
+      </div>
+    </div>
+    <h2 style="margin-top:16px">Stored measurement points <span class="tag" id="rowsnote"></span></h2>
+    <div class="twrap"><table>
+      <thead><tr>
+        <th>ts</th><th>test</th><th>size</th><th>offered pps</th><th>Mbps</th>
+        <th>sent</th><th>received</th><th>loss %</th><th>lat &mu;s (p50/p95/max)</th><th>b2b</th><th>run</th>
+      </tr></thead>
+      <tbody id="benchrows"></tbody>
+    </table></div>
   </div>
 </main>
 
@@ -99,11 +235,11 @@ const COL = { N3: "#38bdf8", N5: "#34d399", N9: "#f59e0b" };
 const prev = new Map();     // "pod|iface|field" -> {ts, v}
 const history = [];         // {total}
 let last = null;
+let benchActive = false;    // to detect run-completion edges
 
-const fabric = document.getElementById("fabric");
-const fctx = fabric.getContext("2d");
-const chart = document.getElementById("chart");
-const cctx = chart.getContext("2d");
+const $ = id => document.getElementById(id);
+const fabric = $("fabric"), fctx = fabric.getContext("2d");
+const chart = $("chart"), cctx = chart.getContext("2d");
 
 function fmt(n) {
   n = Math.max(0, n || 0);
@@ -112,15 +248,11 @@ function fmt(n) {
   if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
   return String(Math.round(n));
 }
-
 function ifacemap(d) {
   const m = {};
   ((d && d.ifaces) || []).forEach(f => { m[f.name] = f; });
   return m;
 }
-
-// Compute rates for all fields of the given ifaces; writes per-poll samples
-// into `prev` exactly once each, so it must be called once per (pod, iface).
 function rates(d, ifList) {
   const r = {};
   ifList.forEach(i => {
@@ -138,11 +270,11 @@ function rates(d, ifList) {
   return r;
 }
 
+// ---------------------------------------------------------------- fabric
 function place(n, y, W, H) {
   return Array.from({ length: n }, (_, i) =>
     n === 1 ? { x: W / 2, y } : { x: W * (0.18 + 0.64 * i / (n - 1)), y });
 }
-
 function rrect(c, x, y, w, h, r) {
   c.beginPath();
   c.moveTo(x + r, y);
@@ -152,7 +284,6 @@ function rrect(c, x, y, w, h, r) {
   c.arcTo(x, y, x + w, y, r);
   c.closePath();
 }
-
 function curveEdge(a, b, pps, color, dip, now) {
   if (pps <= 0.01) return;
   const w = Math.max(1.2, Math.min(11, 1 + pps / 50));
@@ -189,7 +320,6 @@ function curveEdge(a, b, pps, color, dip, now) {
   }
   fctx.restore();
 }
-
 function nodeBox(p, d, sub) {
   const w = 172, h = 58, x = p.x - w / 2, y = p.y - h / 2;
   fctx.save();
@@ -212,7 +342,6 @@ function nodeBox(p, d, sub) {
   fctx.fillText(d.up ? sub : "unreachable", x + 13, p.y + 16);
   fctx.restore();
 }
-
 function renderFabric(ups, tgs, now) {
   const dpr = window.devicePixelRatio || 1;
   const W = fabric.clientWidth, H = fabric.clientHeight;
@@ -231,7 +360,6 @@ function renderFabric(ups, tgs, now) {
   const tgP = place(tgs.length, ty, W, H).map((p, i) => ({ ...p, d: tgs[i] }));
 
   const peerCount = Math.max(1, upP.length - 1);
-  // East-west N9 edges between UPF nodes (measured N9 tx, split over peers).
   upP.forEach((a, i) => upP.forEach((b, j) => {
     if (i >= j) return;
     const pab = (a.d.up ? a.d.rates.N9_txPkts : 0) / peerCount;
@@ -239,15 +367,12 @@ function renderFabric(ups, tgs, now) {
     curveEdge(a, b, pab, COL.N9, 34, now);
     curveEdge(b, a, pba, COL.N9, -34, now);
   }));
-  // North-south edges: traffic gen -> UPF, colored by ingress interface.
-  tgP.forEach(tg => {
-    upP.forEach(up => {
-      if (!tg.d.up || !up.d.up) return;
-      const n = Math.max(1, tgs.length);
-      curveEdge(tg, up, (up.d.rates.N3_rxPkts) / n, COL.N3, 0, now);
-      curveEdge(tg, up, (up.d.rates.N5_rxPkts) / n, COL.N5, 0, now);
-    });
-  });
+  tgP.forEach(tg => upP.forEach(up => {
+    if (!tg.d.up || !up.d.up) return;
+    const n = Math.max(1, tgs.length);
+    curveEdge(tg, up, (up.d.rates.N3_rxPkts) / n, COL.N3, 0, now);
+    curveEdge(tg, up, (up.d.rates.N5_rxPkts) / n, COL.N5, 0, now);
+  }));
 
   upP.forEach(p => nodeBox(p, p.d,
     "N3 " + fmt(p.d.rates.N3_rxPkts) + "  N5 " + fmt(p.d.rates.N5_rxPkts) +
@@ -256,6 +381,7 @@ function renderFabric(ups, tgs, now) {
     "TX " + fmt(p.d.rates.TX_txPkts) + " pps  " + fmt(p.d.flows.length) + " flows"));
 }
 
+// ---------------------------------------------------------------- chart
 function renderChart() {
   const dpr = window.devicePixelRatio || 1;
   const W = chart.clientWidth, H = chart.clientHeight;
@@ -284,10 +410,13 @@ function renderChart() {
   cctx.fillText("peak " + fmt(max) + " pps  (last " + history.length + " polls)", 6, 12);
 }
 
+// ---------------------------------------------------------------- pods
 function podCard(d, kind) {
   const dot = '<span class="dot ' + (d.up ? "ok" : "down") + '"></span>';
   if (kind === "upf") {
     const cls = i => i === "N3" ? "c3" : i === "N5" ? "c5" : "c9";
+    const sess = (d.data && d.data.gauges && d.data.gauges.activeSessions) ?
+      " &middot; " + d.data.gauges.activeSessions + " sess" : "";
     const ifc = i => {
       const f = d.ifs[i] || {};
       return '<div class="ifc"><div class="t ' + cls(i) + '">' + i + '</div>' +
@@ -298,7 +427,7 @@ function podCard(d, kind) {
         '<div class="row"><span class="mut">drop</span><b class="mut">' + fmt(f.dropped || 0) + '</b></div></div>';
     };
     return '<div class="card pod"><div class="head">' + dot + '<span class="name">' + d.name +
-      '</span><span class="url">' + d.url + '</span></div>' +
+      '</span><span class="url">' + d.url + sess + '</span></div>' +
       '<div class="ifaces" style="grid-template-columns:1fr 1fr 1fr">' +
       ["N3", "N5", "N9"].map(ifc).join("") + '</div></div>';
   }
@@ -311,12 +440,10 @@ function podCard(d, kind) {
     '<div class="row"><span class="mut">flows</span><b class="mut">' + d.flows.length + '</b></div>' +
     '</div></div></div>';
 }
-
 function renderPods(ups, tgs) {
-  document.getElementById("pods").innerHTML =
+  $("pods").innerHTML =
     ups.map(d => podCard(d, "upf")).join("") + tgs.map(d => podCard(d, "tg")).join("");
 }
-
 function renderTotals(total, ups, tgs) {
   let h = '<div>Total ingest <b>' + fmt(total) + ' pps</b></div>';
   ups.forEach(d => {
@@ -328,9 +455,8 @@ function renderTotals(total, ups, tgs) {
   tgs.forEach(d => {
     h += '<div class="mut">' + d.name + ' tx: ' + fmt(d.rates.TX_txPkts) + ' pps</div>';
   });
-  document.getElementById("totals").innerHTML = h;
+  $("totals").innerHTML = h;
 }
-
 function renderTable(ups) {
   let html = "";
   ups.forEach(d => ["N3", "N5", "N9"].forEach(i => {
@@ -343,12 +469,11 @@ function renderTable(ups) {
       '<td>' + fmt(f.encaps || 0) + '</td><td>' + fmt(f.decaps || 0) + '</td>' +
       '<td>' + fmt(f.dropped || 0) + '</td></tr>';
   }));
-  document.getElementById("rows").innerHTML = html ||
+  $("rows").innerHTML = html ||
     '<tr><td colspan="10" class="mut">no data yet</td></tr>';
 }
-
 function setStatus(text, live) {
-  const el = document.getElementById("status");
+  const el = $("status");
   el.textContent = text;
   el.className = "badge" + (live ? " live" : "");
 }
@@ -366,7 +491,7 @@ async function poll() {
 
   last = {
     up: (r.upfs || []).map(u => ({
-      name: u.name, url: u.url, up: u.up,
+      name: u.name, url: u.url, up: u.up, data: u.data,
       ts: (u.data && u.data.ts) || r.ts,
       ifs: ifacemap(u.data), flows: []
     })),
@@ -383,21 +508,371 @@ async function poll() {
   history.push({ total });
   if (history.length > 150) history.shift();
 
-  const now = Date.now();
-  renderFabric(last.up, last.tg, now);
+  renderFabric(last.up, last.tg, Date.now());
   renderChart();
   renderTotals(total, last.up, last.tg);
   renderPods(last.up, last.tg);
   renderTable(last.up);
 }
 
+// ------------------------------------------------------------ knob / db
+async function initKnob() {
+  try {
+    const r = await (await fetch("/api/knob", { cache: "no-store" })).json();
+    $("knob").value = r.pct;
+    $("knobv").textContent = Math.round(r.pct) + "%";
+    $("knobmeta").textContent = r.source === "db" ?
+      "restored from database on refresh" : "default level (nothing stored yet)";
+  } catch (e) { /* knob stays at 100 */ }
+}
+$("knob").addEventListener("input", e => {
+  $("knobv").textContent = Math.round(e.target.value) + "%";
+});
+$("knob").addEventListener("change", e => {
+  const pct = Number(e.target.value);
+  $("knobmeta").textContent = "applying&hellip;";
+  fetch("/api/knob", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pct })
+  }).then(r => r.json()).then(() => {
+    $("knobmeta").textContent = "applied to every generator, saved to db";
+  }).catch(() => { $("knobmeta").textContent = "apply failed"; });
+});
+
+async function pollDB() {
+  try {
+    const r = await (await fetch("/api/db", { cache: "no-store" })).json();
+    const el = $("db");
+    if (!r.enabled) {
+      el.textContent = "db disabled"; el.className = "badge"; return;
+    }
+    el.textContent = r.connected ? "db connected" : "db connecting";
+    el.className = "badge " + (r.connected ? "dbok" : "dbdown");
+    let extra = "queued " + (r.inQueue || 0) + " &middot; flushes " + (r.flushes || 0);
+    if (r.dropped) extra += ' &middot; <span style="color:var(--warn)">dropped ' + r.dropped + '</span>';
+    $("dbnote").innerHTML = extra;
+  } catch (e) { /* ignore */ }
+}
+
+// ---------------------------------------------------------- analytics
+function appColor(id) {
+  const c = ["#64748b", "#94a3b8", "#38bdf8", "#818cf8", "#34d399", "#f59e0b", "#fb7185", "#c4b5fd"];
+  return c[(id | 0) % c.length];
+}
+function renderDPI(rows) {
+  const latest = (rows || []).slice(-40).reverse();
+  $("dpinote").textContent = rows ? rows.length + " rows (10 min window)" : "";
+  $("dpirows").innerHTML = latest.length ? latest.map(d =>
+    '<tr><td>' + d.pod + '</td>' +
+    '<td><span class="appname" style="color:' + appColor(d.appId) + '">' + (d.appName || d.appId) + '</span></td>' +
+    '<td>' + d.direction + '</td><td>' + fmt(d.pkts) + '</td><td>' + fmt(d.nbytes) + '</td>' +
+    '<td>' + (d.dropped ? '<span style="color:var(--down)">' + fmt(d.dropped) + '</span>' : '0') + '</td></tr>'
+  ).join("") : '<tr><td colspan="6" class="mut">no classified traffic yet</td></tr>';
+}
+function renderCDRs(rows) {
+  const latest = (rows || []).slice(-12).reverse();
+  $("cdrrows").innerHTML = latest.length ? latest.map(c => {
+    const vol = (c.upBytes + c.downBytes);
+    const dur = c.durationMs > 60000 ? (c.durationMs / 60000).toFixed(1) + "m" :
+      c.durationMs > 2000 ? (c.durationMs / 1000).toFixed(1) + "s" : c.durationMs + "ms";
+    return '<tr><td>#' + c.sessionId + '</td><td>' + c.anchorPod + '</td>' +
+      '<td>' + fmt(vol) + ' B</td><td>' + dur + '</td>' +
+      '<td><span style="color:' + (c.status === "closed" ? "var(--ok)" : "var(--mut)") + '">' + c.status + '</span></td></tr>';
+  }).join("") : '<tr><td colspan="5" class="mut">no CDRs closed yet</td></tr>';
+}
+function evRow(e, kind) {
+  const t = (e.ts || "").replace("T", " ").slice(0, 19);
+  if (kind === "li") {
+    return '<tr><td>' + t + '</td><td>' + e.pod + '</td>' +
+      '<td><span style="color:var(--li)">LI</span> ' + (e.app_name || "") + " " + (e.detail || "") +
+      " teid " + (e.teid || "") + '</td><td>capture</td></tr>';
+  }
+  return '<tr><td>' + t + '</td><td>' + e.pod + '</td>' +
+    '<td>' + (e.rule_id || "") + " &middot; " + (e.app_name || "") + '</td>' +
+    '<td><span style="color:' + (e.action === "drop" ? "var(--down)" : "var(--warn)") + '">' + e.action + '</span></td></tr>';
+}
+async function pollEvents() {
+  try {
+    const [dp, cd, po, li] = await Promise.all([
+      fetch("/api/dpi?since_min=10&limit=500", { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+      fetch("/api/cdrs?since_min=1440&limit=500", { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+      fetch("/api/events?kind=policy&limit=60", { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+      fetch("/api/events?kind=li&limit=60", { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+    ]);
+    renderDPI(dp.rows);
+    renderCDRs(cd.cdrs);
+    const prows = (po.rows || []).slice(0, 30), lrows = (li.rows || []).slice(0, 30);
+    const both = prows.map(x => evRow(x, "p")).concat(lrows.map(x => evRow(x, "li")));
+    $("evrows").innerHTML = both.length ? both.join("") :
+      '<tr><td colspan="4" class="mut">no policy drops / LI captures yet</td></tr>';
+  } catch (e) { /* ignore */ }
+}
+
+// ------------------------------------------------------------ rfc2544
+const SIZE_COLORS = ["#38bdf8", "#34d399", "#f59e0b", "#f472b6", "#a78bfa", "#4ade80", "#fca5a5", "#22d3ee"];
+function ctx2d(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, W, H);
+  c.font = "10px ui-monospace, monospace";
+  c.fillStyle = "#7d8b9c";
+  c.textAlign = "left";
+  return { c, W, H };
+}
+function gridlines(c, W, H, maxV, unit) {
+  c.strokeStyle = "rgba(255,255,255,.05)";
+  c.fillStyle = "#7d8b9c";
+  c.textAlign = "right";
+  for (let g = 0; g <= 4; g++) {
+    const v = maxV * g / 4, y = H - 16 - (g / 4) * (H - 30);
+    c.beginPath(); c.moveTo(34, y); c.lineTo(W - 6, y); c.stroke();
+    c.fillText(fmt(v) + unit, 32, y - 3);
+  }
+  c.textAlign = "left";
+}
+function drawLoss(cv, pts) {
+  // pts: [{size, rates:[{pps,loss}]}] drawn as log-rate curves
+  const { c, W, H } = ctx2d(cv);
+  if (!pts.length) { empty(c, W, H); return; }
+  const rmin = Math.min(...pts.flatMap(p => p.rates.map(r => r.pps)));
+  const rmax = Math.max(...pts.flatMap(p => p.rates.map(r => r.pps)));
+  const lmin = Math.log10(Math.max(1, rmin)), lmax = Math.log10(Math.max(1.001, rmax));
+  const xOf = pps => 40 + (Math.log10(Math.max(1, pps)) - lmin) / Math.max(0.0001, lmax - lmin) * (W - 52);
+  const yOf = l => H - 16 - Math.min(100, l) / 100 * (H - 30);
+  gridlines(c, W, H, 100, "%");
+  pts.forEach((s, i) => {
+    const col = SIZE_COLORS[i % SIZE_COLORS.length];
+    c.strokeStyle = c.fillStyle = col;
+    c.lineWidth = 1.6;
+    c.beginPath();
+    let any = false;
+    s.rates.forEach((r, j) => {
+      const x = xOf(r.pps), y = yOf(r.loss);
+      if (!any) { c.moveTo(x, y); any = true; } else c.lineTo(x, y);
+      c.fillRect(x - 2, y - 2, 4, 4);
+    });
+    c.stroke();
+    c.fillText(s.size + "B", xOf(s.rates[0].pps), 10 + i * 12);
+  });
+}
+function barChart(cv, groups, unit, scale) {
+  // groups: [{label, vals:[v,...]}]
+  const { c, W, H } = ctx2d(cv);
+  if (!groups.length) { empty(c, W, H); return; }
+  const maxV = Math.max(1, ...groups.flatMap(g => g.vals));
+  gridlines(c, W, H, maxV, unit);
+  const n = groups.length, s = groups[0].vals.length;
+  const gw = (W - 52) / n;
+  groups.forEach((g, gi) => {
+    const bw = Math.min(26, (gw - 14) / s);
+    g.vals.forEach((v, vi) => {
+      const x = 40 + gi * gw + gw / 2 - (s * bw + (s - 1) * 3) / 2 + vi * (bw + 3);
+      const h = v / maxV * (H - 30);
+      c.fillStyle = SIZE_COLORS[vi % SIZE_COLORS.length];
+      c.fillRect(x, H - 16 - h, bw, h);
+      if (v > maxV * 0.06) {
+        c.fillText(fmt(v), x - 2, H - 20 - h);
+      }
+    });
+    c.fillStyle = "#7d8b9c";
+    c.textAlign = "center";
+    c.fillText(g.label, 40 + gi * gw + gw / 2, H - 4);
+    c.textAlign = "left";
+  });
+}
+function empty(c, W, H) {
+  c.fillStyle = "#5a6675";
+  c.textAlign = "center";
+  c.font = "12px ui-sans-serif";
+  c.fillText("no stored measurements yet", W / 2, H / 2);
+  c.font = "10px ui-monospace, monospace";
+  c.textAlign = "left";
+}
+
+let lastRows = [];
+async function loadBenchResults() {
+  let out;
+  try {
+    out = await (await fetch("/api/rfc2544?since_min=1440&limit=5000", { cache: "no-store" })).json();
+  } catch (e) { return; }
+  lastRows = out.rows || [];
+  $("rowsnote").textContent = lastRows.length ?
+    lastRows.length + " points since " + (lastRows[0] ? "yesterday" : "&mdash;") : "";
+
+  // newest run id
+  let run = null;
+  if (lastRows.length) {
+    const byRun = {};
+    lastRows.forEach(r => {
+      (byRun[r.runId] = byRun[r.runId] || []).push(r);
+    });
+    const ids = Object.keys(byRun).sort((a, b) => {
+      const va = new Date(byRun[a][0].ts).getTime(), vb = new Date(byRun[b][0].ts).getTime();
+      return vb - va;
+    });
+    run = byRun[ids[0]];
+    $("t_loss").textContent = "run " + ids[0];
+    $("t_tput").textContent = "run " + ids[0];
+    $("t_lat").textContent = "run " + ids[0];
+    $("t_b2b").textContent = "run " + ids[0];
+  }
+
+  // table: latest 20 rows newest first
+  const table = lastRows.slice(-20).reverse();
+  $("benchrows").innerHTML = table.length ? table.map(r =>
+    '<tr><td>' + (r.ts || "").replace("T", " ").slice(0, 19) + '</td>' +
+    '<td>' + r.test + '</td><td>' + r.frameSize + '</td><td>' + fmt(r.offeredPps) + '</td>' +
+    '<td>' + (r.offeredBps ? r.offeredBps.toFixed(2) : "0") + '</td>' +
+    '<td>' + fmt(r.sent) + '</td><td>' + fmt(r.received) + '</td>' +
+    '<td><span style="color:' + (r.lossPct > 0 ? "var(--warn)" : "var(--ok)") + '">' + r.lossPct.toFixed(2) + '</span></td>' +
+    '<td>' + (r.test === "latency" ? r.latP50Us.toFixed(0) + " / " + r.latP95Us.toFixed(0) + " / " + r.latMaxUs.toFixed(0) : "&mdash;") + '</td>' +
+    '<td>' + (r.test === "back2back" ? r.b2bLossless : "&mdash;") + '</td>' +
+    '<td class="mut">' + r.runId + '</td></tr>'
+  ).join("") : '<tr><td colspan="11" class="mut">no benchmark rows yet &mdash; start a run</td></tr>';
+
+  if (!run) {
+    ["c_loss", "c_tput", "c_lat", "c_b2b"].forEach(id => {
+      const { c, W, H } = ctx2d($(id)); empty(c, W, H);
+    });
+    return;
+  }
+
+  // charts per procedure for the newest run
+  const sizes = [...new Set(run.map(r => r.frameSize))].sort((a, b) => a - b);
+  // loss curves
+  drawLoss($("c_loss"), sizes.map(sz => ({
+    size: sz + "B",
+    rates: run.filter(r => r.test === "loss" && r.frameSize === sz)
+      .map(r => ({ pps: r.offeredPps, loss: r.lossPct })).sort((a, b) => a.pps - b.pps),
+  })));
+  barChart($("c_tput"),
+    sizes.map(sz => {
+      const rows = run.filter(r => r.test === "throughput" && r.frameSize === sz);
+      return { label: sz + "B", vals: [rows.length ? rows[0].offeredBps : 0] };
+    }), "M", 1);
+  barChart($("c_lat"),
+    sizes.map(sz => {
+      const rows = run.filter(r => r.test === "latency" && r.frameSize === sz);
+      const r = rows[0] || { latMinUs: 0, latAvgUs: 0, latMaxUs: 0 };
+      return { label: sz + "B", vals: [r.latMinUs, r.latAvgUs, r.latMaxUs] };
+    }), "\u00b5s", 1);
+  barChart($("c_b2b"),
+    sizes.map(sz => {
+      const rows = run.filter(r => r.test === "back2back" && r.frameSize === sz);
+      return { label: sz + "B", vals: [rows.length ? rows[0].b2bLossless : 0] };
+    }), "fr", 1);
+}
+
+async function pollBench() {
+  let st;
+  try {
+    st = await (await fetch("/api/rfc2544/status", { cache: "no-store" })).json();
+  } catch (e) {
+    $("benchtag").textContent = "unreachable";
+    $("start").disabled = true;
+    return;
+  }
+  const s = st.status || {};
+  const tag = $("benchtag"), state = $("benchstate");
+  $("start").disabled = !!s.active;
+  $("cancel").disabled = !s.active;
+  if (s.active) {
+    tag.textContent = "running: " + (s.phase || "active") + " (" + Math.round((s.progress || 0) * 100) + "%)";
+    state.innerHTML = "run in progress: <b>" + (s.phase || "") + "</b>" +
+      '<div class="bar"><i style="width:' + Math.round((s.progress || 0) * 100) + '%"></i></div>' +
+      (s.lastError ? '<div style="color:var(--warn)">last error: ' + s.lastError + "</div>" : "");
+  } else {
+    tag.textContent = "idle";
+    state.innerHTML = s.lastError ?
+      '<span style="color:var(--warn)">last error: ' + s.lastError + "</span>" :
+      "idle &mdash; profile: " +
+      JSON.stringify((st.profile && st.profile.frame_sizes) || []).slice(1, -1) + " octets default";
+  }
+  const finished = benchActive && !s.active; // edge: run just completed
+  benchActive = !!s.active;
+  if (finished) loadBenchResults();
+}
+
+// profile-driven defaults on first status load
+let profileSeeded = false;
+async function seedProfile() {
+  if (profileSeeded) return;
+  try {
+    const r = await (await fetch("/api/rfc2544/status", { cache: "no-store" })).json();
+    const p = r.profile || {};
+    if (p.frame_sizes && p.frame_sizes.length) {
+      $("fsizes").placeholder = p.frame_sizes.join(", ");
+      $("durms").placeholder = p.duration_ms || 2000;
+      $("rates").placeholder = (p.min_rate || 64) + ", " + (p.max_rate || 250000);
+      $("latrate").placeholder = p.latency_rate || 64;
+      $("b2bsizes").placeholder = (p.b2b_sizes || []).join(", ");
+      profileSeeded = true;
+    }
+  } catch (e) { /* retry next tick */ }
+}
+
+$("start").addEventListener("click", async () => {
+  const body = { tests: [...$("tests").querySelectorAll(".chip.on")].map(c => c.dataset.t) };
+  const num = (v, k) => { if (v !== "" && isFinite(v)) body[k] = Number(v); };
+  if ($("fsizes").value.trim()) body.frame_sizes = $("fsizes").value.split(",").map(s => Math.round(Number(s.trim()))).filter(v => v > 0);
+  num($("durms").value.trim(), "duration_ms");
+  if ($("rates").value.trim()) {
+    const [a, b] = $("rates").value.split(",").map(s => Number(s.trim()));
+    if (a > 0) body.min_rate = a;
+    if (b > 0) body.max_rate = b;
+  }
+  num($("latrate").value.trim(), "latency_rate");
+  if ($("b2bsizes").value.trim()) body.b2b_sizes = $("b2bsizes").value.split(",").map(s => Math.round(Number(s.trim()))).filter(v => v > 0);
+  try {
+    const resp = await fetch("/api/rfc2544", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      $("benchstate").innerHTML = '<span style="color:var(--down)">start rejected: ' + t.slice(0, 240) + "</span>";
+      return;
+    }
+    $("benchstate").textContent = "run accepted&hellip;";
+    pollBench();
+  } catch (e) {
+    $("benchstate").innerHTML = '<span style="color:var(--down)">start failed: ' + e.message + "</span>";
+  }
+});
+$("cancel").addEventListener("click", async () => {
+  try {
+    await fetch("/api/rfc2544/cancel", { method: "POST" });
+    pollBench();
+  } catch (e) { /* ignore */ }
+});
+document.querySelectorAll("#tests .chip").forEach(ch => ch.addEventListener("click", () => {
+  const on = document.querySelectorAll("#tests .chip.on").length;
+  if (ch.classList.contains("on") && on === 1) return; // keep at least one
+  ch.classList.toggle("on");
+}));
+
 window.addEventListener("resize", () => {
   if (last) renderFabric(last.up, last.tg, Date.now());
   renderChart();
+  loadBenchResults();
 });
 
 poll();
 setInterval(poll, POLL_MS);
+setInterval(pollDB, 5000);
+setInterval(pollEvents, 5000);
+setInterval(pollBench, 1000);
+pollDB();
+pollEvents();
+pollBench();
+seedProfile();
+setInterval(seedProfile, 5000);
+initKnob();
+loadBenchResults();
+setInterval(loadBenchResults, 20000);
 </script>
 </body>
 </html>
