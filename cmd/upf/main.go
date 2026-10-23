@@ -36,6 +36,15 @@ func main() {
 	dnTarget := flag.String("dn-target", envOr("DN_TARGET", ""),
 		`DN egress "host:port" for plain-IP delivery (empty = count only)`)
 	metricsAddr := flag.String("metrics", ":8080", "control-lite HTTP listen address")
+	inspection := flag.Bool("inspection", envBoolOr("UPF_INSPECTION", true),
+		"enable the SPI/DPI/policy/CDR pipeline")
+	policyPath := flag.String("policy", envOr("UPF_POLICY", ""),
+		"policy rules file (YAML); empty = allow-all")
+	liSessions := flag.String("li-sessions", envOr("UPF_LI_SESSIONS", "0-7"),
+		`lawful-interception session selector, e.g. "0-7,42"`)
+	liRing := flag.Int("li-ring", envIntOr("UPF_LI_RING", 1024), "bounded event ring size")
+	cdrIdle := flag.Duration("cdr-idle", envDurOr("UPF_CDR_IDLE", 15*time.Second), "session idle time that closes a CDR")
+	cdrMin := flag.Duration("cdr-min", envDurOr("UPF_CDR_MIN", time.Second), "minimum session lifetime before a CDR closes")
 	flag.Parse()
 
 	id, err := ordinal(*name)
@@ -54,6 +63,12 @@ func main() {
 		Sessions:        *sessions,
 		DNTarget:        *dnTarget,
 		Workers:         *workers,
+		Inspection:      *inspection,
+		PolicyPath:      *policyPath,
+		LISelection:     *liSessions,
+		LIRing:          *liRing,
+		CDRIdle:         *cdrIdle,
+		CDRMin:          *cdrMin,
 	})
 	log.Printf("upf %s: node %d of %d — N3 udp/:%d N5 udp/:%d N9 udp/:%d, %d sessions, %d workers",
 		*name, id, *nodes, *n3port, *n5port, *n9port, *sessions, *workers)
@@ -94,6 +109,24 @@ func ordinal(name string) (uint8, error) {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envBoolOr(k string, def bool) bool {
+	if v := os.Getenv(k); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+func envDurOr(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }

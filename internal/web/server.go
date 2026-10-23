@@ -8,14 +8,18 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
+
+	"github.com/midu/telco-upf-gen/internal/dbstore"
 )
 
 //go:embed templates/index.html
@@ -32,6 +36,7 @@ type Server struct {
 	upfs       []endpoint
 	tgs        []endpoint
 	tpl        *template.Template
+	store      *dbstore.Store // optional persistent store
 }
 
 // New builds the dashboard server. Specs are "name=http://host:port,..."
@@ -44,6 +49,10 @@ func New(upfSpec, tgSpec string) *Server {
 		tpl:        template.Must(template.ParseFS(tplFS, "templates/index.html")),
 	}
 }
+
+// SetStore attaches the persistent store (nil-safe: UI history endpoints
+// report db disabled until it is set).
+func (s *Server) SetStore(st *dbstore.Store) { s.store = st }
 
 func (s *Server) UpfCount() int { return len(s.upfs) }
 func (s *Server) TgCount() int  { return len(s.tgs) }
@@ -93,6 +102,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/", s.index)
 	mux.HandleFunc("/api/topology", s.topology)
 	mux.HandleFunc("/api/stats", s.stats)
+	// persistent-state APIs (UI refresh re-derives its state from the DB)
+	mux.HandleFunc("/api/db", s.dbStatus)
+	mux.HandleFunc("/api/knob", s.knob)
+	mux.HandleFunc("/api/cdrs", s.cdRs)
+	mux.HandleFunc("/api/dpi", s.dpiHistory)
+	mux.HandleFunc("/api/metrics", s.metricsHistory)
+	mux.HandleFunc("/api/events", s.events)
 	return mux
 }
 
@@ -196,4 +212,156 @@ func (s *Server) getJSON(url string, out any) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// ---------------------------------------------------------------------------
+// persistent-state APIs: the dashboard re-reads everything from the database
+// on refresh, so closing the browser (or restarting this pod) loses nothing.
+// ---------------------------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) dbStatus(w http.ResponseWriter, _ *http.Request) {
+	if s.store == nil {
+		writeJSON(w, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, s.store.Status())
+}
+
+func (s *Server) knob(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.GetKnob())
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<10))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		trimmed := strings.TrimSpace(string(body))
+		var pct float64
+		if strings.HasPrefix(trimmed, "{") {
+			var v struct {
+				Pct float64 `json:"pct"`
+			}
+			if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
+				http.Error(w, "expected {\"pct\":0-100}", http.StatusBadRequest)
+				return
+			}
+			pct = v.Pct
+		} else if trimmed == "" {
+			http.Error(w, "expected {\"pct\":0-100}", http.StatusBadRequest)
+			return
+		} else if pct, err = strconv.ParseFloat(trimmed, 64); err != nil {
+			http.Error(w, "expected a number 0-100", http.StatusBadRequest)
+			return
+		}
+		pct, err = s.SetKnob(r.Context(), pct)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, KnobState{Pct: pct, Source: "set"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) cdRsEnabled() (*dbstore.Store, error) {
+	if s.store == nil {
+		return nil, errDBDisabled
+	}
+	return s.store, nil
+}
+
+var errDBDisabled = fmt.Errorf("database not configured (set DB_DSN on the webui)")
+
+// cdRs lists recently closed CDRs from the database.
+func (s *Server) cdRs(w http.ResponseWriter, r *http.Request) {
+	store, err := s.cdRsEnabled()
+	if err != nil {
+		writeJSON(w, map[string]any{"cdrs": nil, "error": err.Error()})
+		return
+	}
+	sinceMin := queryInt(r, "since_min", 10)
+	limit := queryInt(r, "limit", 500)
+	cdrs, err := store.CDRsSince(time.Now().Add(-time.Duration(sinceMin)*time.Minute), limit)
+	if err != nil {
+		writeJSON(w, map[string]any{"cdrs": nil, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"cdrs": cdrs, "count": len(cdrs)})
+}
+
+func (s *Server) dpiHistory(w http.ResponseWriter, r *http.Request) {
+	store, err := s.cdRsEnabled()
+	if err != nil {
+		writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+		return
+	}
+	sinceMin := queryInt(r, "since_min", 10)
+	limit := queryInt(r, "limit", 5000)
+	rows, err := store.DPISumSince(time.Now().Add(-time.Duration(sinceMin)*time.Minute), limit)
+	if err != nil {
+		writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"rows": rows, "count": len(rows)})
+}
+
+func (s *Server) metricsHistory(w http.ResponseWriter, r *http.Request) {
+	store, err := s.cdRsEnabled()
+	if err != nil {
+		writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+		return
+	}
+	sinceMin := queryInt(r, "since_min", 10)
+	limit := queryInt(r, "limit", 5000)
+	rows, err := store.MetricsSince(time.Now().Add(-time.Duration(sinceMin)*time.Minute), limit)
+	if err != nil {
+		writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"rows": rows, "count": len(rows)})
+}
+
+func (s *Server) events(w http.ResponseWriter, r *http.Request) {
+	store, err := s.cdRsEnabled()
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	limit := queryInt(r, "limit", 200)
+	var rows any
+	switch kind {
+	case "policy", "":
+		rows, err = store.PolicyEvents(limit)
+	case "li":
+		rows, err = store.LIEvents(limit)
+	default:
+		http.Error(w, "kind must be policy|li", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"kind": kind, "rows": rows})
+}
+
+func queryInt(r *http.Request, key string, def int) int {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
 }

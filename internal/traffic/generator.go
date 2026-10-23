@@ -7,6 +7,7 @@ package traffic
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -58,12 +59,13 @@ func (f *Flow) capSize() int {
 }
 
 // Tick injects up to the accumulated token bucket and returns emitted
-// packets/bytes. The flow must be dialed first.
-func (f *Flow) Tick(dtSec float64) (uint64, uint64) {
+// packets/bytes. throttlePct scales the flow's target PPS (0-100). The
+// flow must be dialed first.
+func (f *Flow) Tick(dtSec, throttlePct float64) (uint64, uint64) {
 	if f.conn == nil {
 		return 0, 0
 	}
-	f.carry += f.PPS * dtSec
+	f.carry += f.PPS * (throttlePct / 100.0) * dtSec
 	if f.carry < 1 {
 		return 0, 0
 	}
@@ -92,10 +94,11 @@ func (f *Flow) Tick(dtSec float64) (uint64, uint64) {
 
 // buildPacket encodes one GTP-U G-PDU into dst (reused capacity) and
 // returns the packet slice. Half the packets carry a sequence-number
-// extension header to exercise the full header decoder.
+// extension header to exercise the full header decoder; the inner user
+// datagram carries a realistic per-flow application stack for DPI.
 func (f *Flow) buildPacket(dst []byte) []byte {
-	payload := fakeIP(f.conn.LocalAddr(), f.Teid)
 	seq := f.nextSeq.Add(1)
+	payload := fakeIP(f.conn.LocalAddr(), f.Teid, seq)
 	hdr := gtpu.Header{Teid: f.Teid}
 	if seq&1 == 1 {
 		s16 := uint16(seq)
@@ -142,6 +145,10 @@ type Generator struct {
 	mu      sync.Mutex
 	flows   []*Flow
 	flowsBy map[string]*net.UDPConn // dest -> shared egress socket
+
+	// throttle is the output level in percent (0-100), stored as
+	// math.Float64bits so it can be changed without the flow lock.
+	throttle atomic.Uint64
 }
 
 // NewGenerator creates a generator pod. period is the token-bucket tick.
@@ -149,12 +156,14 @@ func NewGenerator(name string, period time.Duration) *Generator {
 	if period < time.Millisecond {
 		period = 10 * time.Millisecond
 	}
-	return &Generator{
+	g := &Generator{
 		name:    name,
 		period:  period,
 		stats:   telemetry.NewNode(name, "traffic", "TX"),
 		flowsBy: map[string]*net.UDPConn{},
 	}
+	g.throttle.Store(math.Float64bits(100))
+	return g
 }
 
 func (g *Generator) Stats() *telemetry.Node { return g.stats }
@@ -191,12 +200,32 @@ func (g *Generator) Dial() error {
 	return nil
 }
 
+// SetThrottle sets the output level (0-100) clamped to range, and returns
+// the effective value. Takes effect on the next bucket tick.
+func (g *Generator) SetThrottle(pct float64) float64 {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	g.throttle.Store(math.Float64bits(pct))
+	g.stats.Gauge("throttle").Set(int64(pct))
+	return pct
+}
+
+// Throttle returns the current output level.
+func (g *Generator) Throttle() float64 {
+	return math.Float64frombits(g.throttle.Load())
+}
+
 // Start runs the token-bucket loop until ctx is cancelled.
 func (g *Generator) Start(ctx context.Context) {
 	go func() {
 		t := time.NewTicker(g.period)
 		defer t.Stop()
 		g.stats.Gauge("flows").Set(int64(len(g.flows)))
+		g.stats.Gauge("throttle").Set(int64(g.Throttle()))
 
 		dt := g.period.Seconds()
 		for {
@@ -215,9 +244,10 @@ func (g *Generator) tick(dtSec float64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	tx := g.stats.Iface("TX")
+	throttle := g.Throttle()
 	var pkts, bytes uint64
 	for _, f := range g.flows {
-		p, b := f.Tick(dtSec)
+		p, b := f.Tick(dtSec, throttle)
 		pkts += p
 		bytes += b
 	}
@@ -260,39 +290,7 @@ func (g *Generator) FlowsSnapshot() []FlowSnap {
 	return out
 }
 
-// fakeIP builds a synthetic IPv4/UDP user datagram. The fake gNB source
-// address is derived from the flow's own socket (real source), the
-// destination is a deterministic per-TEID "UE" address, and the IP/UDP
-// pseudo-header checksums are computed so captured packets look genuine.
-func fakeIP(local net.Addr, teid uint32) []byte {
-	src := net.IPv4(10, 10, 9, 9)
-	if la, ok := local.(*net.UDPAddr); ok && la.IP.To4() != nil {
-		src = la.IP.To4()
-	}
-	dst := net.IPv4(10, 99, byte(teidSeq16(teid)>>8), byte(teidSeq16(teid)))
-
-	payload := make([]byte, 20+udpPayload(teid))
-	copy(payload[12:16], src)
-	copy(payload[16:20], dst)
-	total := len(payload)
-	payload[0] = 0x45 // v4, no options
-	payload[8] = 64   // ttl
-	payload[9] = 17   // udp
-	payload[2] = byte(total >> 8)
-	payload[3] = byte(total)
-	s := ipSum(payload[0:20])
-	ck := uint16(^s)
-	payload[4] = byte(ck >> 8)
-	payload[5] = byte(ck)
-	return payload
-}
-
 func teidSeq16(t uint32) uint32 { return t & 0xffff }
-
-func udpPayload(teid uint32) int {
-	// Vary size a little by TEID so per-flow byte rates differ realistically.
-	return int(36 + teidSeq16(teid)%512)
-}
 
 // ipSum returns the ones-complement 16-bit sum of b (b length must be even).
 func ipSum(b []byte) uint32 {

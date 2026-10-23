@@ -1,0 +1,30 @@
+# Traffic generator configuration for an EXTERNAL machine (dual-mode).
+#
+# Run the same binary / container anywhere that can reach the fabric:
+#
+#   bin/trafficgen -config /path/to/trafficgen-external.yaml
+#
+# Fill in the fabric's reachable endpoints (cluster host + NodePort, or a
+# LB / route IP). `discover` is ignored when `upf` is non-empty.
+name: trafficgen-ext-0
+interval_ms: 20
+pps: 100
+throttle: 50                 # start at half rate; tweak live via /api/throttle
+max_sessions: 32
+duration: ""                 # e.g. "30m" to stop automatically
+
+upf:
+  - host: 192.0.2.10         # <- your cluster / NodePort address
+    node: 0
+    sessions: 64
+    ports:
+      n3: 32152              # <- NodePort for UPF N3 GTP-U
+      n5: 32153              # <- NodePort for UPF N5 GTP-U
+      n9: 0                  # external generators typically skip N9 direct
+  - host: 192.0.2.10
+    node: 1
+    sessions: 64
+    ports:
+      n3: 32152
+      n5: 32153
+      n9: 0

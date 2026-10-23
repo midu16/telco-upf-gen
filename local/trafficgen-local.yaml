@@ -1,0 +1,11 @@
+# Traffic generator configuration for the local podman stack (make test-local).
+# Discovered via the podman network aliases (upf-0 / upf-1), no cluster DNS.
+name: trafficgen-0
+interval_ms: 20
+pps: 100              # per flow at 100% throttle
+throttle: 100         # 0-100 initial output level
+max_sessions: 32
+discover:
+  dns: upf-{n}        # podman network alias, {n} = node ordinal
+  nodes: 2
+  metrics_port: 8080

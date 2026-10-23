@@ -636,6 +636,162 @@ func (s *Store) CDRsSince(since time.Time, limit int) ([]CDR, error) {
 	return out, rows.Err()
 }
 
+// MetricsRow is one persisted (pod, iface) sample.
+type MetricsRow struct {
+	Ts       time.Time `json:"ts"`
+	Pod      string    `json:"pod"`
+	IFace    string    `json:"iface"`
+	RxPkts   uint64    `json:"rxPkts"`
+	TxPkts   uint64    `json:"txPkts"`
+	RxBytes  uint64    `json:"rxBytes"`
+	TxBytes  uint64    `json:"txBytes"`
+	Encaps   uint64    `json:"encaps"`
+	Decaps   uint64    `json:"decaps"`
+	Dropped  uint64    `json:"dropped"`
+	NErrors  uint64    `json:"nErrors"`
+	RxPps    float64   `json:"rxPps"`
+	TxPps    float64   `json:"txPps"`
+	Throttle float64   `json:"throttle"`
+}
+
+// MetricsSince lists stored samples since ts, oldest first, capped.
+func (s *Store) MetricsSince(since time.Time, limit int) ([]MetricsRow, error) {
+	if limit <= 0 || limit > 20000 {
+		limit = 5000
+	}
+	rows, err := s.query(`SELECT ts, pod, iface, rx_pkts, tx_pkts, rx_bytes, tx_bytes,
+		encaps, decaps, dropped, n_errors, rx_pps, tx_pps, throttle
+		FROM metrics_ts WHERE ts >= $1 ORDER BY ts ASC, pod, iface LIMIT $2`,
+		since.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MetricsRow
+	for rows.Next() {
+		var r MetricsRow
+		if err := rows.Scan(&r.Ts, &r.Pod, &r.IFace, &r.RxPkts, &r.TxPkts,
+			&r.RxBytes, &r.TxBytes, &r.Encaps, &r.Decaps, &r.Dropped,
+			&r.NErrors, &r.RxPps, &r.TxPps, &r.Throttle); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DPISumSince lists stored SPI/DPI aggregate rows since ts, capped.
+func (s *Store) DPISumSince(since time.Time, limit int) ([]DPISummary, error) {
+	if limit <= 0 || limit > 20000 {
+		limit = 10000
+	}
+	rows, err := s.query(`SELECT ts, pod, iface, direction, app_id, app_name, pkts, nbytes, dropped
+		FROM dpi_summary WHERE ts >= $1 ORDER BY ts ASC, pod, iface, app_id LIMIT $2`,
+		since.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DPISummary
+	for rows.Next() {
+		var ts time.Time
+		var d DPISummary
+		if err := rows.Scan(&ts, &d.Pod, &d.IFace, &d.Direction, &d.AppID, &d.AppName, &d.Pkts, &d.NBytes, &d.Dropped); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PolicyEvRow is one stored policy enforcement event.
+type PolicyEvRow struct {
+	Ts         time.Time `json:"ts"`
+	Pod        string    `json:"pod"`
+	IFace      string    `json:"iface"`
+	Direction  string    `json:"direction"`
+	OuterSrc   string    `json:"outerSrc"`
+	OuterDst   string    `json:"outerDst"`
+	InnerSrc   string    `json:"innerSrc"`
+	InnerDst   string    `json:"innerDst"`
+	L4Proto    string    `json:"l4Proto"`
+	SrcPort    string    `json:"srcPort"`
+	DstPort    string    `json:"dstPort"`
+	AppName    string    `json:"appName"`
+	RuleID     string    `json:"ruleId"`
+	Action     string    `json:"action"`
+	PayloadLen int32     `json:"payloadLen"`
+}
+
+func (s *Store) policyEvRows(q string, args ...any) (any, error) {
+	queryer, ok := s.db.(queryer)
+	if !ok {
+		return nil, errors.New("dbstore: underlying driver does not support queries")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.PingTimeout*2)
+	defer cancel()
+	rows, err := queryer.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		m := map[string]any{}
+		for i, c := range cols {
+			switch v := vals[i].(type) {
+			case []byte:
+				m[c] = string(v)
+			case time.Time:
+				m[c] = v.UTC().Format(time.RFC3339)
+			case nil:
+				m[c] = ""
+			default:
+				m[c] = v
+			}
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// PolicyEvents lists recent policy enforcement events, newest first.
+func (s *Store) PolicyEvents(limit int) (any, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	return s.policyEvRows(`SELECT ts, pod, iface, direction,
+		COALESCE(outer_src,''), COALESCE(outer_dst,''),
+		COALESCE(inner_src::text,''), COALESCE(inner_dst::text,''),
+		COALESCE(l4_proto::text,''), COALESCE(src_port::text,''), COALESCE(dst_port::text,''),
+		COALESCE(app_name,''), rule_id, action, payload_len
+		FROM policy_events ORDER BY ts DESC, id DESC LIMIT $1`, limit)
+}
+
+// LIEvents lists recent lawful-interception records, newest first.
+func (s *Store) LIEvents(limit int) (any, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	return s.policyEvRows(`SELECT ts, pod, '', direction, '', '',
+		COALESCE(inner_src::text,''), COALESCE(inner_dst::text,''),
+		COALESCE(l4_proto::text,''), COALESCE(src_port::text,''), COALESCE(dst_port::text,''),
+		COALESCE(app_name,''), '', '', payload_len, session_id, teid, detail
+		FROM li_events ORDER BY ts DESC, id DESC LIMIT $1`, limit)
+}
+
 func (s *Store) query(q string, args ...any) (*sql.Rows, error) {
 	qr, ok := s.db.(queryer)
 	if !ok {

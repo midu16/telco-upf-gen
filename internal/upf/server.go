@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/midu/telco-upf-gen/internal/dpi"
 	"github.com/midu/telco-upf-gen/internal/gtpu"
 	"github.com/midu/telco-upf-gen/internal/telemetry"
+	"github.com/midu/telco-upf-gen/internal/usage"
 )
 
 var errLoop = errors.New("upf: F-TEID points at own node on N9")
@@ -31,6 +33,15 @@ type Config struct {
 	Sessions        int
 	DNTarget        string // "host:port" for plain-IP delivery; empty = count only
 	Workers         int
+
+	// SPI/DPI pipeline (Inspection=false disables it entirely; the data
+	// plane then forwards without inspection, zero overhead).
+	Inspection  bool
+	PolicyPath  string        // optional YAML policy file (ConfigMap-mounted)
+	LISelection string        // session selector "0-7,42" ("" = none selected)
+	LIRing      int           // bounded LI/policy event rings
+	CDRIdle     time.Duration // session inactivity that closes a CDR
+	CDRMin      time.Duration // minimum session lifetime before closing
 }
 
 // UPF is one node of the distributed user plane.
@@ -38,6 +49,8 @@ type UPF struct {
 	cfg      Config
 	stats    *telemetry.Node
 	sessions *Table
+	engine   *dpi.Engine
+	ledger   *usage.Ledger
 
 	mu    sync.Mutex
 	conns map[string]*net.UDPConn // per-destination egress tunnels
@@ -62,13 +75,27 @@ func New(cfg Config) *UPF {
 	if cfg.N9Port == 0 {
 		cfg.N9Port = 2154
 	}
-	return &UPF{
+	u := &UPF{
 		cfg:      cfg,
 		stats:    telemetry.NewNode(cfg.NodeName, "upf", "N3", "N5", "N9"),
 		sessions: NewTable(cfg.Sessions),
 		conns:    map[string]*net.UDPConn{},
 		cache:    map[uint8]*net.UDPAddr{},
 	}
+	if cfg.Inspection {
+		policy, err := dpi.LoadPolicy(cfg.PolicyPath)
+		if err != nil {
+			log.Printf("upf %s: policy load failed, running allow-all: %v", cfg.NodeName, err)
+			policy = &dpi.Policy{}
+		}
+		ring := cfg.LIRing
+		if ring <= 0 {
+			ring = 1024
+		}
+		u.engine = dpi.NewEngine(policy, cfg.LISelection, ring)
+		u.ledger = usage.NewLedger(cfg.NodeName, int16(cfg.NodeID), cfg.CDRIdle, cfg.CDRMin)
+	}
+	return u
 }
 
 // Stats exposes the node telemetry root.
@@ -181,9 +208,12 @@ var bufPool = sync.Pool{New: func() any {
 	return &b
 }}
 
-// Run starts the three UDP interfaces and the forwarding worker pool. It
-// blocks until ctx is cancelled or a listener fails.
+// Run starts the three UDP interfaces, the CDR sweeper and the forwarding
+// worker pool. It blocks until ctx is cancelled or a listener fails.
 func (u *UPF) Run(ctx context.Context) error {
+	if u.ledger != nil {
+		go u.cdrSweeper(ctx)
+	}
 	ifaces := []struct {
 		name string
 		port int
@@ -309,6 +339,10 @@ func (u *UPF) ingress(j job) {
 			f.Errors.Add(1)
 			return
 		}
+		if u.engine != nil && !u.inspect("N3", usage.DirUL, seq, teid, j.src, pkt.Payload) {
+			f.Dropped.Add(1)
+			return
+		}
 		if tnode == int(u.cfg.NodeID) {
 			// Locally anchored session: decap, deliver plain IP to the DN.
 			u.deliverDN(pkt.Payload)
@@ -334,6 +368,10 @@ func (u *UPF) ingress(j job) {
 		if ns != TeidNSN5 || tnode < 0 || tnode >= int(u.cfg.Nodes) {
 			f.Dropped.Add(1)
 			f.Errors.Add(1)
+			return
+		}
+		if u.engine != nil && !u.inspect("N5", usage.DirDL, seq, teid, j.src, pkt.Payload) {
+			f.Dropped.Add(1)
 			return
 		}
 		if tnode == int(u.cfg.NodeID) {
@@ -415,6 +453,38 @@ func (u *UPF) deliverDN(payload []byte) {
 	}
 }
 
+// inspect runs the SPI/DPI/policy pipeline over one incoming G-PDU payload
+// on an ingress interface (N3=UL, N5=DL) and returns false if the policy
+// dropped the packet. Usage (CDR) accounting happens here as well, exactly
+// once per packet: N9 is pure transit and never re-accounts.
+func (u *UPF) inspect(iface, dir string, seq uint32, teid uint32, src *net.UDPAddr, payload []byte) bool {
+	v := u.engine.Inspect(iface, dir, seq, teid, src.String(), u.cfg.NodeName, payload)
+	if !v.Allow {
+		u.stats.Gauge("policyDrops").Add(1)
+	}
+	if v.SPI.Valid {
+		u.ledger.Touch(seq, dir, uint16(v.AppID), uint64(len(payload)), v.SPI.Src, v.SPI.Dst)
+	}
+	return v.Allow
+}
+
+// cdrSweeper closes idle sessions into CDRs on a coarse cadence.
+func (u *UPF) cdrSweeper(ctx context.Context) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			u.ledger.CloseIdle(time.Now()) // final sweep on shutdown
+			return
+		case <-t.C:
+			u.ledger.CloseIdle(time.Now())
+			u.stats.Gauge("activeSessions").Set(int64(u.ledger.Active()))
+			u.stats.Gauge("cdrsPending").Set(int64(u.ledger.PendingCount()))
+		}
+	}
+}
+
 // Handler exposes the per-node control-lite endpoints.
 func (u *UPF) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -429,6 +499,38 @@ func (u *UPF) Handler() http.Handler {
 	mux.HandleFunc("/api/teids", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(u.Teids())
+	})
+	mux.HandleFunc("/api/dpi", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if u.engine == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"enabled": true, "engine": u.engine.Snapshot()})
+	})
+	mux.HandleFunc("/api/cdrs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if u.ledger == nil {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(u.ledger.DrainCDRs())
+	})
+	mux.HandleFunc("/api/events/policy", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if u.engine == nil {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(u.engine.PolicyEvents())
+	})
+	mux.HandleFunc("/api/events/li", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if u.engine == nil {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(u.engine.LIEvents())
 	})
 	return mux
 }

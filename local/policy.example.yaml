@@ -1,0 +1,31 @@
+# Example UPF policy profile (SPI/DPI enforcement rules).
+# Ship per-cluster profiles via ConfigMap and mount at /etc/upf/policy.yaml
+# (UPF_POLICY=/etc/upf/policy.yaml). First matching rule wins; unmatched
+# traffic is allowed.
+#
+# Rule fields:
+#   id          unique rule id (shown in policy events / UI)
+#   description human text
+#   apps        [dns, http, https, ssh, quic, icmp, other]  (empty = any)
+#   proto       tcp | udp | icmp | any
+#   ports       inclusive ranges of the inner DST port
+#   nets        CIDRs applied to the inner DST address
+#   action      allow | observe | drop
+rules:
+  - id: drop-bulk-crypto-tor
+    description: drop flows targeting a known-bad destination block (example)
+    nets: ["198.51.100.0/24"]
+    action: drop
+
+  - id: observe-quic
+    description: watch QUIC traffic (logged, not touched)
+    apps: [quic]
+    action: observe
+
+  - id: dns-rate-watch
+    description: observe recursive DNS leaving the fabric
+    apps: [dns]
+    proto: udp
+    ports:
+      - { from: 53, to: 53 }
+    action: observe
