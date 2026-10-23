@@ -153,7 +153,7 @@ type BenchResult struct {
 	Test        string  `json:"test"`
 	FrameSize   int     `json:"frameSize"`
 	OfferedPPS  float64 `json:"offeredPps"`
-	OfferedBPS  float64 `json:"offeredBps"` // Mbps
+	OfferedBPS  float64 `json:"offeredBps"` // bits/s
 	Sent        uint64  `json:"sent"`
 	Received    uint64  `json:"received"`
 	LossPct     float64 `json:"lossPct"`
@@ -702,7 +702,7 @@ func (e *runEngine) result(run *BenchRun, t BenchTest, size int, rate float64, s
 		Test:       string(t),
 		FrameSize:  size,
 		OfferedPPS: rate,
-		OfferedBPS: rate * float64(size) * 8 / 1e6,
+		OfferedBPS: rate * float64(size) * 8, // true bits/s; UI renders /1e6 as Mbps
 		Sent:       sent,
 		Received:   got,
 	}

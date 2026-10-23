@@ -725,7 +725,7 @@ async function loadBenchResults() {
   $("benchrows").innerHTML = table.length ? table.map(r =>
     '<tr><td>' + (r.ts || "").replace("T", " ").slice(0, 19) + '</td>' +
     '<td>' + r.test + '</td><td>' + r.frameSize + '</td><td>' + fmt(r.offeredPps) + '</td>' +
-    '<td>' + (r.offeredBps ? r.offeredBps.toFixed(2) : "0") + '</td>' +
+    '<td>' + (r.offeredBps ? (r.offeredBps / 1e6).toFixed(2) : "0") + '</td>' +
     '<td>' + fmt(r.sent) + '</td><td>' + fmt(r.received) + '</td>' +
     '<td><span style="color:' + (r.lossPct > 0 ? "var(--warn)" : "var(--ok)") + '">' + r.lossPct.toFixed(2) + '</span></td>' +
     '<td>' + (r.test === "latency" ? r.latP50Us.toFixed(0) + " / " + r.latP95Us.toFixed(0) + " / " + r.latMaxUs.toFixed(0) : "&mdash;") + '</td>' +
@@ -751,7 +751,7 @@ async function loadBenchResults() {
   barChart($("c_tput"),
     sizes.map(sz => {
       const rows = run.filter(r => r.test === "throughput" && r.frameSize === sz);
-      return { label: sz + "B", vals: [rows.length ? rows[0].offeredBps : 0] };
+      return { label: sz + "B", vals: [rows.length ? rows[0].offeredBps / 1e6 : 0] };
     }), "M", 1);
   barChart($("c_lat"),
     sizes.map(sz => {
