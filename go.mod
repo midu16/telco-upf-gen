@@ -1,6 +1,6 @@
 module github.com/midu/telco-upf-gen
 
-go 1.27
+go 1.24
 
 require github.com/lib/pq v1.12.3
 
