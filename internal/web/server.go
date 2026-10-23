@@ -4,6 +4,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -109,6 +110,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/dpi", s.dpiHistory)
 	mux.HandleFunc("/api/metrics", s.metricsHistory)
 	mux.HandleFunc("/api/events", s.events)
+	// RFC 2544 benchmark dashboard (results read from the DB, control
+	// forwarded to a generator)
+	mux.HandleFunc("/api/rfc2544", s.rfc2544)
+	mux.HandleFunc("/api/rfc2544/status", s.rfc2544Status)
+	mux.HandleFunc("/api/rfc2544/cancel", s.rfc2544Cancel)
 	return mux
 }
 
@@ -352,6 +358,100 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"kind": kind, "rows": rows})
+}
+
+// ---------------------------------------------------------------------------
+// RFC 2544 dashboard APIs
+// ---------------------------------------------------------------------------
+
+// pickTG selects one traffic generator endpoint (tg=<name> query param;
+// default = the first configured one).
+func (s *Server) pickTG(name string) (endpoint, error) {
+	if len(s.tgs) == 0 {
+		return endpoint{}, fmt.Errorf("no traffic generators configured (set TRAFFICGENS)")
+	}
+	if name == "" {
+		return s.tgs[0], nil
+	}
+	for _, c := range s.tgs {
+		if c.Name == name {
+			return c, nil
+		}
+	}
+	return endpoint{}, fmt.Errorf("traffic generator %q not configured", name)
+}
+
+// forwardTG proxies one request to a generator and copies the response
+// back (status code included), so the UI sees the generator's own errors.
+func (s *Server) forwardTG(w http.ResponseWriter, r *http.Request, method, path string) {
+	c, err := s.pickTG(r.URL.Query().Get("tg"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancel()
+	var rdr io.Reader
+	if method == http.MethodPost || method == http.MethodPut {
+		b, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.URL+path, rdr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, io.LimitReader(resp.Body, 1<<20)); err != nil {
+		log.Printf("webui: forwardTG %s %s: %v", method, path, err)
+	}
+}
+
+// rfc2544: GET reads persisted measurement points (since_min minutes back,
+// default 24h); POST forwards a start request to the selected generator.
+func (s *Server) rfc2544(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		store, err := s.cdRsEnabled()
+		if err != nil {
+			writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+			return
+		}
+		sinceMin := queryInt(r, "since_min", 1440)
+		limit := queryInt(r, "limit", 5000)
+		rows, err := store.RFC2544Since(time.Now().Add(-time.Duration(sinceMin)*time.Minute), limit)
+		if err != nil {
+			writeJSON(w, map[string]any{"rows": nil, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"rows": rows, "count": len(rows)})
+	case http.MethodPost:
+		s.forwardTG(w, r, http.MethodPost, "/api/rfc2544")
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// rfc2544Status proxies the generator's live bench status (lite: no runs).
+func (s *Server) rfc2544Status(w http.ResponseWriter, r *http.Request) {
+	s.forwardTG(w, r, http.MethodGet, "/api/rfc2544?lite=1")
+}
+
+// rfc2544Cancel asks the selected generator to cancel its active run.
+func (s *Server) rfc2544Cancel(w http.ResponseWriter, r *http.Request) {
+	s.forwardTG(w, r, http.MethodPost, "/api/rfc2544/cancel")
 }
 
 func queryInt(r *http.Request, key string, def int) int {

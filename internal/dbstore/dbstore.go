@@ -12,8 +12,9 @@
 //     single transaction. Transient database outages buffer up to QueueSize
 //     jobs; the oldest are dropped once the queue is full (monotonic counters
 //     self-heal on the next sample).
-//   - The schema (sql/001_init.sql) is embedded and applied idempotently on
-//     first connect; no separate migration tooling or init container.
+//   - The schema (sql/*.sql, applied in name order) is embedded and executed
+//     idempotently on first connect; no separate migration tooling or init
+//     container.
 package dbstore
 
 import (
@@ -26,6 +27,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -253,7 +255,7 @@ func (s *Store) flush(ctx context.Context) {
 			return
 		}
 		s.migrated.Store(true)
-		s.setNote("connected; schema applied (001_init)")
+		s.setNote("connected (%s)", time.Now().Format(time.RFC3339))
 	}
 
 	var jobs []job
@@ -296,9 +298,10 @@ drain:
 	s.lastFlush.Store(time.Now().UnixMilli())
 }
 
-// migrate applies the embedded DDL once per connection lifetime.
+// migrate applies the embedded DDL (sql/*.sql in name order, each registered
+// in schema_migrations) once per connection lifetime.
 func (s *Store) migrate(ctx context.Context) error {
-	raw, err := sqlFS.ReadFile("sql/001_init.sql")
+	entries, err := sqlFS.ReadDir("sql")
 	if err != nil {
 		return fmt.Errorf("dbstore: read schema: %w", err)
 	}
@@ -306,16 +309,34 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, string(raw)); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("dbstore: apply schema: %w", err)
+	applied := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".sql") {
+			continue
+		}
+		raw, err := sqlFS.ReadFile("sql/" + name)
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("dbstore: read schema %s: %w", name, err)
+		}
+		if _, err := tx.ExecContext(ctx, string(raw)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("dbstore: apply schema %s: %w", name, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING`, name); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		applied = append(applied, name)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO schema_migrations (name) VALUES ('001_init') ON CONFLICT DO NOTHING`); err != nil {
+	if err := tx.Commit(); err != nil {
 		_ = tx.Rollback()
-		return err
+		return fmt.Errorf("dbstore: commit schema: %w", err)
 	}
-	return tx.Commit()
+	s.setNote("schema applied: %s", strings.Join(applied, ", "))
+	return nil
 }
 
 // enqueue records a write job; when the queue is full the job is dropped and
@@ -534,6 +555,56 @@ func (s *Store) UpsertCDR(c CDR) {
 	})
 }
 
+// RFC2544Result is one RFC 2544 measurement point as reported by a traffic
+// generator (field names match the generator's /api/rfc2544 JSON).
+type RFC2544Result struct {
+	RunID       string  `json:"runId"`
+	Ts          string  `json:"ts"` // RFC3339; unparseable stamps fall back to write time
+	Test        string  `json:"test"`
+	FrameSize   int     `json:"frameSize"`
+	OfferedPPS  float64 `json:"offeredPps"`
+	OfferedBPS  float64 `json:"offeredBps"`
+	Sent        uint64  `json:"sent"`
+	Received    uint64  `json:"received"`
+	LossPct     float64 `json:"lossPct"`
+	LatMinUS    float64 `json:"latMinUs"`
+	LatAvgUS    float64 `json:"latAvgUs"`
+	LatMaxUS    float64 `json:"latMaxUs"`
+	LatP50US    float64 `json:"latP50Us"`
+	LatP95US    float64 `json:"latP95Us"`
+	LatP99US    float64 `json:"latP99Us"`
+	B2BLossless int     `json:"b2bLossless"`
+}
+
+const rfc2544SQL = `INSERT INTO rfc2544_results
+	(run_id, test, frame_size, offered_pps, tg_pod, ts,
+	 offered_bps, sent, received, loss_pct,
+	 lat_min_us, lat_avg_us, lat_max_us, lat_p50_us, lat_p95_us, lat_p99_us,
+	 b2b_lossless)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+	ON CONFLICT (run_id, test, frame_size, offered_pps) DO NOTHING`
+
+// UpsertRFC2544 buffers the measurement points of one generator run against
+// tgPod. Per-point idempotency comes from the table's primary key, so a
+// re-upsert of the same run changes nothing.
+func (s *Store) UpsertRFC2544(tgPod string, results []RFC2544Result) {
+	for _, r := range results {
+		res := r // capture per job
+		ts, err := time.Parse(time.RFC3339Nano, res.Ts)
+		if err != nil {
+			ts = time.Now().UTC()
+		}
+		s.enqueue(func(ctx context.Context, tx driverTx) error {
+			_, err := tx.ExecContext(ctx, rfc2544SQL,
+				res.RunID, res.Test, res.FrameSize, res.OfferedPPS, tgPod, ts.UTC(),
+				res.OfferedBPS, res.Sent, res.Received, res.LossPct,
+				res.LatMinUS, res.LatAvgUS, res.LatMaxUS, res.LatP50US,
+				res.LatP95US, res.LatP99US, res.B2BLossless)
+			return err
+		})
+	}
+}
+
 // SetUIState persists a UI configuration value (e.g. the traffic knob).
 func (s *Store) SetUIState(key string, v any) {
 	b, err := json.Marshal(v)
@@ -632,6 +703,59 @@ func (s *Store) CDRsSince(since time.Time, limit int) ([]CDR, error) {
 		}
 		c.Apps = json.RawMessage(apps)
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RFC2544Row is one stored RFC 2544 measurement point.
+type RFC2544Row struct {
+	RunID       string    `json:"runId"`
+	Ts          time.Time `json:"ts"`
+	Test        string    `json:"test"`
+	FrameSize   int       `json:"frameSize"`
+	OfferedPPS  float64   `json:"offeredPps"`
+	TgPod       string    `json:"tgPod"`
+	OfferedBPS  float64   `json:"offeredBps"`
+	Sent        uint64    `json:"sent"`
+	Received    uint64    `json:"received"`
+	LossPct     float64   `json:"lossPct"`
+	LatMinUS    float64   `json:"latMinUs"`
+	LatAvgUS    float64   `json:"latAvgUs"`
+	LatMaxUS    float64   `json:"latMaxUs"`
+	LatP50US    float64   `json:"latP50Us"`
+	LatP95US    float64   `json:"latP95Us"`
+	LatP99US    float64   `json:"latP99Us"`
+	B2BLossless int       `json:"b2bLossless"`
+}
+
+// RFC2544Since lists stored benchmark measurement points since ts, oldest
+// first, capped.
+func (s *Store) RFC2544Since(since time.Time, limit int) ([]RFC2544Row, error) {
+	if limit <= 0 || limit > 20000 {
+		limit = 5000
+	}
+	rows, err := s.query(`SELECT run_id, ts, test, frame_size, offered_pps, tg_pod,
+		offered_bps, sent, received, loss_pct,
+		lat_min_us, lat_avg_us, lat_max_us, lat_p50_us, lat_p95_us, lat_p99_us,
+		b2b_lossless
+		FROM rfc2544_results WHERE ts >= $1
+		ORDER BY ts ASC, run_id, test, frame_size, offered_pps LIMIT $2`,
+		since.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RFC2544Row
+	for rows.Next() {
+		var r RFC2544Row
+		if err := rows.Scan(&r.RunID, &r.Ts, &r.Test, &r.FrameSize, &r.OfferedPPS,
+			&r.TgPod, &r.OfferedBPS, &r.Sent, &r.Received, &r.LossPct,
+			&r.LatMinUS, &r.LatAvgUS, &r.LatMaxUS, &r.LatP50US,
+			&r.LatP95US, &r.LatP99US, &r.B2BLossless); err != nil {
+			return nil, err
+		}
+		r.Ts = r.Ts.UTC()
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

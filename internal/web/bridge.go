@@ -124,6 +124,17 @@ type cdrSnap struct {
 	Status     string               `json:"status"`
 }
 
+// rfcRunSnap is one finished benchmark run as reported by a generator
+// (subset of /api/rfc2544); results reuse the store's wire type.
+type rfcRunSnap struct {
+	RunID    string                  `json:"runId"`
+	Started  string                  `json:"started"`
+	Finished string                  `json:"finished,omitempty"`
+	Target   string                  `json:"target"`
+	Error    string                  `json:"error,omitempty"`
+	Results  []dbstore.RFC2544Result `json:"results"`
+}
+
 // Bridge aggregates the fabric and persists it.
 type Bridge struct {
 	store *dbstore.Store
@@ -138,6 +149,8 @@ type Bridge struct {
 	// nodeIDs[pod] from /api/teids
 	nodeIDs  map[string]int
 	upfTeids map[string]bool
+	// seenRuns[tgPod][runId] = true: benchmark runs already persisted
+	seenRuns map[string]map[string]bool
 }
 
 type prevIface struct {
@@ -158,12 +171,13 @@ func NewBridge(store *dbstore.Store, srv *Server, interval time.Duration) *Bridg
 		interval = 5 * time.Second
 	}
 	return &Bridge{
-		store:   store,
-		srv:     srv,
-		intv:    interval,
-		prevIf:  map[string]prevIface{},
-		prevDPI: map[string]prevDPI{},
-		nodeIDs: map[string]int{},
+		store:    store,
+		srv:      srv,
+		intv:     interval,
+		prevIf:   map[string]prevIface{},
+		prevDPI:  map[string]prevDPI{},
+		nodeIDs:  map[string]int{},
+		seenRuns: map[string]map[string]bool{},
 	}
 }
 
@@ -385,6 +399,47 @@ func (b *Bridge) pollTG(ctx context.Context, c endpoint) {
 		"flows":    flows,
 		"throttle": throttle,
 	})
+	b.pollRFC2544(ctx, c)
+}
+
+// pollRFC2544 upserts finished benchmark runs not yet persisted for this
+// generator. Runs are recorded once (marked seen when their results are
+// captured), keyed by run id; an active run is only polled after it
+// finishes, so partial result sets never reach the store.
+func (b *Bridge) pollRFC2544(ctx context.Context, c endpoint) {
+	var env struct {
+		Runs []rfcRunSnap `json:"runs"`
+	}
+	if err := b.getJSON(ctx, c.URL+"/api/rfc2544", &env); err != nil {
+		return // silent: the bench is optional and polled every tick
+	}
+	b.mu.Lock()
+	seen, ok := b.seenRuns[c.Name]
+	if !ok {
+		seen = map[string]bool{}
+		b.seenRuns[c.Name] = seen
+	}
+	var uns []dbstore.RFC2544Result
+	for _, run := range env.Runs {
+		if run.RunID == "" || seen[run.RunID] || run.Finished == "" {
+			continue
+		}
+		seen[run.RunID] = true
+		for _, r := range run.Results {
+			if r.RunID == "" {
+				r.RunID = run.RunID
+			}
+			if r.Ts == "" {
+				r.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			uns = append(uns, r)
+		}
+	}
+	b.mu.Unlock()
+	if len(uns) > 0 {
+		log.Printf("webui: persisting %d rfc2544 results from %s", len(uns), c.Name)
+		b.store.UpsertRFC2544(c.Name, uns)
+	}
 }
 
 // persistDPIDeltas converts cumulative engine rows into interval deltas.

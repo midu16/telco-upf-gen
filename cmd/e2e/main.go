@@ -5,6 +5,7 @@
 //  3. traffic flow — UPF ingress counters increase between two samples
 //  4. DB persist   — webui bridge writes metrics (+SPI/DPI rows) into Postgres
 //  5. CDR report   — closed session CDRs land in the store
+//  6. RFC 2544 run — a small benchmark completes and its results persist
 //
 // It talks to the cluster entirely through the `oc` CLI ($KUBECONFIG) and
 // port-forwards, so it runs from any workstation with kube access. Exit
@@ -84,6 +85,9 @@ func main() {
 	}, {
 		name: "CDR reporting",
 		fn:   e.checkCDR,
+	}, {
+		name: "RFC 2544 baseline run (+ persistence)",
+		fn:   e.checkRFC2544,
 	}} {
 		log.Printf("== e2e: %s", c.name)
 		if err := c.fn(); err != nil {
@@ -388,7 +392,103 @@ func (e *e2e) checkCDR() error {
 	}
 }
 
-// ------------------------------------------------------------ transport
+// ------------------------------------------------------------------------- rfc2544
+
+type benchRunOut struct {
+	RunID    string `json:"runId"`
+	Finished string `json:"finished"`
+	Error    string `json:"error"`
+	Results  []struct {
+		Test     string  `json:"test"`
+		Sent     uint64  `json:"sent"`
+		Received uint64  `json:"received"`
+		LossPct  float64 `json:"lossPct"`
+	} `json:"results"`
+}
+
+// checkRFC2544 launches a small baseline benchmark against the live fabric,
+// verifies the run completes with sane measurement points, and that the
+// results reach the store through the webui bridge.
+func (e *e2e) checkRFC2544() error {
+	tg, stop := e.portForward("tg-rfc", "svc/tg-hs", 18083, 8080)
+	defer stop()
+	base := "http://" + tg
+
+	var lite struct {
+		Status struct {
+			Active bool `json:"active"`
+		} `json:"status"`
+	}
+	if err := getJSON(base+"/api/rfc2544?lite=1", &lite); err != nil {
+		return fmt.Errorf("bench status: %w", err)
+	}
+	if lite.Status.Active {
+		if err := postJSON(base+"/api/rfc2544/cancel", `{}`, nil); err != nil {
+			return fmt.Errorf("cancel pre-existing run: %w", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Baseline profile: smallest frame, tight windows (~10-15s wall time).
+	req := `{"frame_sizes":[64],"duration_ms":300,"min_rate":100,"max_rate":4000,` +
+		`"latency_rate":150,"b2b_sizes":[128,1024],` +
+		`"tests":["loss","throughput","latency","back2back"]}`
+	if err := postJSON(base+"/api/rfc2544", req, nil); err != nil {
+		return fmt.Errorf("start bench: %w", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Minute)
+	var last struct {
+		Runs []benchRunOut `json:"runs"`
+	}
+	for time.Now().Before(deadline) {
+		if err := getJSON(base+"/api/rfc2544", &last); err != nil {
+			return err
+		}
+		if len(last.Runs) > 0 && last.Runs[0].Finished != "" {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if len(last.Runs) == 0 || last.Runs[0].Finished == "" {
+		_ = postJSON(base+"/api/rfc2544/cancel", `{}`, nil)
+		return errors.New("bench run did not finish within 2m (cancelled)")
+	}
+	run := last.Runs[0]
+	if run.Error != "" {
+		return fmt.Errorf("bench run %s failed: %s", run.RunID, run.Error)
+	}
+	if len(run.Results) == 0 {
+		return fmt.Errorf("bench run %s produced no results", run.RunID)
+	}
+	procedures := map[string]bool{}
+	for _, r := range run.Results {
+		if r.Sent == 0 {
+			return fmt.Errorf("procedure %s measured nothing sent", r.Test)
+		}
+		if r.LossPct < 0 || r.LossPct > 100 {
+			return fmt.Errorf("procedure %s lossPct = %v", r.Test, r.LossPct)
+		}
+		procedures[r.Test] = true
+	}
+	for _, t := range []string{"loss", "throughput", "latency", "back2back"} {
+		if !procedures[t] {
+			return fmt.Errorf("procedure %s missing from run %s", t, run.RunID)
+		}
+	}
+	log.Printf("   run %s: %d measurement points", run.RunID, len(run.Results))
+
+	// Results must reach the store (bridge polls + flushes within seconds).
+	db, stopDB, err := e.db()
+	if err != nil {
+		return err
+	}
+	defer stopDB()
+	defer db.Close()
+	return e.waitRows(db, `SELECT count(*) FROM rfc2544_results`, 90*time.Second, "rfc2544_results")
+}
+
+// --------------------------------------------------------------- transport
 
 // portForward starts `oc -n ns port-forward`, waits until the local port
 // answers, and returns ("127.0.0.1:port", stopFunc). An already-open port

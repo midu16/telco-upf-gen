@@ -21,6 +21,7 @@ upf:
       n3: 32152              # <- NodePort for UPF N3 GTP-U
       n5: 32153              # <- NodePort for UPF N5 GTP-U
       n9: 0                  # external generators typically skip N9 direct
+    control: 32151           # UPF control-lite (needed for the RFC 2544 bench DN-target switch)
   - host: 192.0.2.10
     node: 1
     sessions: 64
@@ -28,3 +29,17 @@ upf:
       n3: 32152
       n5: 32153
       n9: 0
+    control: 32151
+
+# RFC 2544 benchmark defaults; external mode needs upf[].control above so
+# the generator can switch the anchor UPF's DN target at its sink.
+bench:
+  frame_sizes: [64, 256, 1518]
+  duration_ms: 2000
+  min_rate: 64
+  max_rate: 250000
+  latency_rate: 64
+  candidate_rates: []
+  b2b_sizes: [256, 1024, 4096]
+  tests: [loss, throughput, latency, back2back]
+

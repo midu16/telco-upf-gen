@@ -9,3 +9,18 @@ discover:
   dns: upf-{n}        # podman network alias, {n} = node ordinal
   nodes: 2
   metrics_port: 8080
+
+# RFC 2544 benchmark defaults (overridable per run via POST /api/rfc2544).
+# In discovery mode the anchor UPF's control endpoint comes from the same
+# host as the metrics port (that is where /api/teids and /api/dn-target
+# live), so no extra wiring is needed here.
+bench:
+  frame_sizes: [64, 256, 1518]   # full G-PDU octets
+  duration_ms: 2000              # per-measurement window
+  min_rate: 64                   # throughput search floor (pps)
+  max_rate: 250000               # throughput search ceiling (pps)
+  latency_rate: 64               # offered pps during latency tests
+  candidate_rates: []            # optional loss sweep (empty = auto ladder)
+  b2b_sizes: [256, 1024, 4096]   # back-to-back burst candidates (frames)
+  tests: [loss, throughput, latency, back2back]
+
