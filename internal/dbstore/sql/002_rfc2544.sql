@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS rfc2544_results (
   tg_pod       text             NOT NULL,      -- reporting generator pod
   ts           timestamptz      NOT NULL,      -- measurement completion time
 
-  offered_bps  double precision NOT NULL DEFAULT 0, -- offered megabits/s over the wire
+  offered_bps  double precision NOT NULL DEFAULT 0, -- offered bits/s over the wire
   sent         bigint           NOT NULL DEFAULT 0,
   received     bigint           NOT NULL DEFAULT 0,
   loss_pct     double precision NOT NULL DEFAULT 0,

@@ -110,6 +110,7 @@ func FromEnv() (Options, bool) {
 			o.QueueSize = n
 		}
 	}
+	o.setDefaults() // expose the effective config to callers (webui startup log)
 	return o, o.DSN != ""
 }
 
