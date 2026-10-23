@@ -402,10 +402,11 @@ func (b *Bridge) pollTG(ctx context.Context, c endpoint) {
 	b.pollRFC2544(ctx, c)
 }
 
-// pollRFC2544 upserts finished benchmark runs not yet persisted for this
-// generator. Runs are recorded once (marked seen when their results are
-// captured), keyed by run id; an active run is only polled after it
-// finishes, so partial result sets never reach the store.
+// pollRFC2544 persists finished benchmark runs of this generator. A run is
+// re-upserted until all of its measurement points are verified present in
+// the store (the upsert is idempotent), so a dropped write batch under queue
+// pressure cannot lose a run — the next poll repairs it. Only then is the
+// run marked seen, which bounds the re-check work.
 func (b *Bridge) pollRFC2544(ctx context.Context, c endpoint) {
 	var env struct {
 		Runs []rfcRunSnap `json:"runs"`
@@ -420,11 +421,20 @@ func (b *Bridge) pollRFC2544(ctx context.Context, c endpoint) {
 		b.seenRuns[c.Name] = seen
 	}
 	var uns []dbstore.RFC2544Result
+	var done []string
 	for _, run := range env.Runs {
 		if run.RunID == "" || seen[run.RunID] || run.Finished == "" {
 			continue
 		}
-		seen[run.RunID] = true
+		if len(run.Results) == 0 { // nothing to persist (e.g. aborted run)
+			seen[run.RunID] = true
+			continue
+		}
+		have, err := b.store.RFC2544RunRows(run.RunID)
+		if err == nil && have >= len(run.Results) {
+			done = append(done, run.RunID) // fully stored; stop re-upserting
+			continue
+		}
 		for _, r := range run.Results {
 			if r.RunID == "" {
 				r.RunID = run.RunID
@@ -434,6 +444,9 @@ func (b *Bridge) pollRFC2544(ctx context.Context, c endpoint) {
 			}
 			uns = append(uns, r)
 		}
+	}
+	for _, id := range done {
+		seen[id] = true
 	}
 	b.mu.Unlock()
 	if len(uns) > 0 {
