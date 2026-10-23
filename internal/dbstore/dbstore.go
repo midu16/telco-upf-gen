@@ -239,18 +239,24 @@ func (s *Store) loop() {
 	}
 }
 
-// flush pings, migrates once, then commits one batch of queued jobs.
+// drainBurstBatches bounds how many batches one flush tick may commit, so
+// a burst of reports (per-packet LI events, poll backlogs) cannot starve the
+// 5s tick: one tick can move up to 16 * MaxBatch jobs.
+const drainBurstBatches = 16
+
+// flush pings, migrates once, then burst-drains the queue in
+// transaction-sized batches.
 func (s *Store) flush(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, s.opts.PingTimeout)
+	pingCtx, cancel := context.WithTimeout(ctx, s.opts.PingTimeout)
 	defer cancel()
 
-	if err := s.db.PingContext(ctx); err != nil {
+	if err := s.db.PingContext(pingCtx); err != nil {
 		s.setNote("disconnected (%v); retrying next cycle", err)
 		return
 	}
 
 	if !s.migrated.Load() {
-		if err := s.migrate(ctx); err != nil {
+		if err := s.migrate(pingCtx); err != nil {
 			s.setNote("migrate failed: %v", err)
 			return
 		}
@@ -258,44 +264,48 @@ func (s *Store) flush(ctx context.Context) {
 		s.setNote("connected (%s)", time.Now().Format(time.RFC3339))
 	}
 
-	var jobs []job
-drain:
-	for len(jobs) < s.opts.MaxBatch {
-		select {
-		case j := <-s.queue:
-			jobs = append(jobs, j)
-		default:
-			break drain
+	batchCtx, bcancel := context.WithTimeout(ctx, s.opts.PingTimeout*4)
+	defer bcancel()
+	for n := 0; n < drainBurstBatches; n++ {
+		var jobs []job
+	drain:
+		for len(jobs) < s.opts.MaxBatch {
+			select {
+			case j := <-s.queue:
+				jobs = append(jobs, j)
+			default:
+				break drain
+			}
 		}
-	}
-	if len(jobs) == 0 {
-		return
-	}
-
-	tx, err := s.begin(ctx)
-	if err != nil {
-		s.dropped.Add(int64(len(jobs)))
-		s.setNote("begin failed: %v (batch of %d dropped)", err, len(jobs))
-		return
-	}
-	for i, j := range jobs {
-		if err := j.apply(ctx, tx); err != nil {
-			_ = tx.Rollback()
-			s.dropped.Add(int64(len(jobs) - i))
-			s.setNote("tx failed at job %d/%d: %v", i+1, len(jobs), err)
+		if len(jobs) == 0 {
 			return
 		}
+
+		tx, err := s.begin(batchCtx)
+		if err != nil {
+			s.dropped.Add(int64(len(jobs)))
+			s.setNote("begin failed: %v (batch of %d dropped)", err, len(jobs))
+			return
+		}
+		for i, j := range jobs {
+			if err := j.apply(batchCtx, tx); err != nil {
+				_ = tx.Rollback()
+				s.dropped.Add(int64(len(jobs)))
+				s.setNote("tx failed at job %d/%d: %v", i+1, len(jobs), err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			s.dropped.Add(int64(len(jobs)))
+			s.setNote("commit failed: %v (batch of %d dropped)", err, len(jobs))
+			return
+		}
+		s.flushed.Add(int64(len(jobs)))
+		s.batches.Add(1)
+		s.queuedNow.Add(-int64(len(jobs)))
+		s.lastFlush.Store(time.Now().UnixMilli())
 	}
-	if err := tx.Commit(); err != nil {
-		_ = tx.Rollback()
-		s.dropped.Add(int64(len(jobs)))
-		s.setNote("commit failed: %v (batch of %d dropped)", err, len(jobs))
-		return
-	}
-	s.flushed.Add(int64(len(jobs)))
-	s.batches.Add(1)
-	s.queuedNow.Add(-int64(len(jobs)))
-	s.lastFlush.Store(time.Now().UnixMilli())
 }
 
 // migrate applies the embedded DDL (sql/*.sql in name order, each registered
@@ -642,11 +652,11 @@ func nilInet(s string) any {
 
 // GetUIState returns the stored JSON for one UI state key.
 func (s *Store) GetUIState(key string) (json.RawMessage, error) {
-	rows, err := s.query(`SELECT value FROM ui_state WHERE key = $1`, key)
+	rows, done, err := s.query(`SELECT value FROM ui_state WHERE key = $1`, key)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	if !rows.Next() {
 		return nil, nil
 	}
@@ -659,11 +669,11 @@ func (s *Store) GetUIState(key string) (json.RawMessage, error) {
 
 // UIState returns all stored UI state pairs.
 func (s *Store) UIState() (map[string]json.RawMessage, error) {
-	rows, err := s.query(`SELECT key, value FROM ui_state ORDER BY key`)
+	rows, done, err := s.query(`SELECT key, value FROM ui_state ORDER BY key`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	out := make(map[string]json.RawMessage)
 	for rows.Next() {
 		var k string
@@ -681,7 +691,7 @@ func (s *Store) CDRsSince(since time.Time, limit int) ([]CDR, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 500
 	}
-	rows, err := s.query(`SELECT session_id, anchor_pod, node_id,
+	rows, done, err := s.query(`SELECT session_id, anchor_pod, node_id,
 		COALESCE(ue_addr::text,''), COALESCE(dn_addr::text,''),
 		up_pkts, down_pkts, up_bytes, down_bytes,
 		started_at, ended_at, duration_ms, apps, rating, status
@@ -690,7 +700,7 @@ func (s *Store) CDRsSince(since time.Time, limit int) ([]CDR, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	var out []CDR
 	for rows.Next() {
 		var c CDR
@@ -734,7 +744,7 @@ func (s *Store) RFC2544Since(since time.Time, limit int) ([]RFC2544Row, error) {
 	if limit <= 0 || limit > 20000 {
 		limit = 5000
 	}
-	rows, err := s.query(`SELECT run_id, ts, test, frame_size, offered_pps, tg_pod,
+	rows, done, err := s.query(`SELECT run_id, ts, test, frame_size, offered_pps, tg_pod,
 		offered_bps, sent, received, loss_pct,
 		lat_min_us, lat_avg_us, lat_max_us, lat_p50_us, lat_p95_us, lat_p99_us,
 		b2b_lossless
@@ -744,7 +754,7 @@ func (s *Store) RFC2544Since(since time.Time, limit int) ([]RFC2544Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	var out []RFC2544Row
 	for rows.Next() {
 		var r RFC2544Row
@@ -758,6 +768,24 @@ func (s *Store) RFC2544Since(since time.Time, limit int) ([]RFC2544Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RFC2544RunRows returns how many measurement points are already stored for
+// one generator run id.
+func (s *Store) RFC2544RunRows(runID string) (int, error) {
+	rows, done, err := s.query(`SELECT count(*) FROM rfc2544_results WHERE run_id = $1`, runID)
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if !rows.Next() {
+		return 0, errors.New("dbstore: count query returned no row")
+	}
+	var n int
+	if err := rows.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, rows.Err()
 }
 
 // MetricsRow is one persisted (pod, iface) sample.
@@ -783,14 +811,14 @@ func (s *Store) MetricsSince(since time.Time, limit int) ([]MetricsRow, error) {
 	if limit <= 0 || limit > 20000 {
 		limit = 5000
 	}
-	rows, err := s.query(`SELECT ts, pod, iface, rx_pkts, tx_pkts, rx_bytes, tx_bytes,
+	rows, done, err := s.query(`SELECT ts, pod, iface, rx_pkts, tx_pkts, rx_bytes, tx_bytes,
 		encaps, decaps, dropped, n_errors, rx_pps, tx_pps, throttle
 		FROM metrics_ts WHERE ts >= $1 ORDER BY ts ASC, pod, iface LIMIT $2`,
 		since.UTC(), limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	var out []MetricsRow
 	for rows.Next() {
 		var r MetricsRow
@@ -809,13 +837,13 @@ func (s *Store) DPISumSince(since time.Time, limit int) ([]DPISummary, error) {
 	if limit <= 0 || limit > 20000 {
 		limit = 10000
 	}
-	rows, err := s.query(`SELECT ts, pod, iface, direction, app_id, app_name, pkts, nbytes, dropped
+	rows, done, err := s.query(`SELECT ts, pod, iface, direction, app_id, app_name, pkts, nbytes, dropped
 		FROM dpi_summary WHERE ts >= $1 ORDER BY ts ASC, pod, iface, app_id LIMIT $2`,
 		since.UTC(), limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer done()
 	var out []DPISummary
 	for rows.Next() {
 		var ts time.Time
@@ -853,12 +881,13 @@ func (s *Store) policyEvRows(q string, args ...any) (any, error) {
 		return nil, errors.New("dbstore: underlying driver does not support queries")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.PingTimeout*2)
-	defer cancel()
 	rows, err := queryer.QueryContext(ctx, q, args...)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	defer rows.Close()
+	// rows must be closed before their context is canceled (lib/pq).
+	defer func() { rows.Close(); cancel() }()
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -916,12 +945,20 @@ func (s *Store) LIEvents(limit int) (any, error) {
 		FROM li_events ORDER BY ts DESC, id DESC LIMIT $1`, limit)
 }
 
-func (s *Store) query(q string, args ...any) (*sql.Rows, error) {
+// query runs q on the read pool and returns rows plus a done() cleanup.
+// The context must stay alive until all rows are consumed (lib/pq aborts a
+// streaming result when its context is canceled), so callers defer done()
+// — which closes the rows first and only then cancels.
+func (s *Store) query(q string, args ...any) (*sql.Rows, func(), error) {
 	qr, ok := s.db.(queryer)
 	if !ok {
-		return nil, errors.New("dbstore: underlying driver does not support queries")
+		return nil, nil, errors.New("dbstore: underlying driver does not support queries")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.PingTimeout*2)
-	defer cancel()
-	return qr.QueryContext(ctx, q, args...)
+	rows, err := qr.QueryContext(ctx, q, args...)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return rows, func() { rows.Close(); cancel() }, nil
 }
