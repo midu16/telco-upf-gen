@@ -24,7 +24,7 @@ header .sub{color:var(--mut);font-size:12px}
 .badge.dbok{color:var(--accent);border-color:rgba(56,189,248,.4)}
 .badge.dbdown{color:var(--warn);border-color:rgba(251,191,36,.4)}
 header .right{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-main{padding:18px 22px 40px;max-width:1600px;margin:0 auto;display:grid;gap:16px}
+main{padding:18px clamp(10px,2.5vw,22px) 40px;max-width:1600px;margin:0 auto;display:grid;gap:16px}
 .card{background:var(--panel);border:1px solid var(--border);
   border-radius:10px;padding:14px 16px;min-width:0}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;
@@ -38,7 +38,7 @@ h2 .tag{font-size:10px;letter-spacing:.4px;text-transform:none;color:var(--mut);
 #chart{width:100%;height:110px;display:block}
 #totals{font-family:ui-monospace,Menlo,monospace;font-size:13px}
 #totals div{margin-top:4px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;min-width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(330px,100%),1fr));gap:14px;min-width:0}
 .pod .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .dot{width:9px;height:9px;border-radius:50%;flex:none}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(34,197,94,.7)}
@@ -46,12 +46,16 @@ h2 .tag{font-size:10px;letter-spacing:.4px;text-transform:none;color:var(--mut);
 .pod .name{font-weight:600}
 .pod .url{color:var(--mut);font-size:11px;margin-left:auto;
   font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;max-width:46%}
-.ifaces{display:grid;gap:8px}
-.ifc{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.ifaces{display:grid;gap:8px;min-width:0}
+.ifaces.tri{grid-template-columns:repeat(auto-fit,minmax(min(104px,100%),1fr))}
+.ifc{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;
+  min-width:0;overflow:hidden}
 .ifc .t{font-size:11px;font-weight:700;letter-spacing:.5px}
 .ifc .c3{color:var(--n3)} .ifc .c5{color:var(--n5)} .ifc .c9{color:var(--n9)}
 .ifc .row{display:flex;justify-content:space-between;font-size:12px;margin-top:4px;
-  font-family:ui-monospace,Menlo,monospace;gap:8px}
+  font-family:ui-monospace,Menlo,monospace;gap:8px;min-width:0}
+.ifc .row .mut{flex:none}
+.ifc .row b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mut{color:var(--mut)}
 .twrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:12px;
@@ -69,7 +73,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .knobmeta{margin-top:8px;font-size:11px;color:var(--mut)}
 
 /* rfc2544 */
-.rfcgrid{display:grid;grid-template-columns:minmax(300px,340px) minmax(0,1fr);gap:16px;align-items:start}
+.rfcgrid{display:grid;grid-template-columns:minmax(min(300px,100%),340px) minmax(0,1fr);gap:16px;align-items:start}
 fieldset{border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:0}
 legend{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);padding:0 6px}
 label.f{display:block;font-size:11px;color:var(--mut);margin-top:8px}
@@ -90,18 +94,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
   border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--panel2)}
 .bar{height:6px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;margin-top:6px;overflow:hidden}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--n5));width:0%}
-.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:14px;min-width:0}
 .charts .card{min-height:180px}
 canvas.cv{width:100%;height:190px;display:block}
 .note{font-size:11px;color:var(--mut);margin-top:4px}
 
-.threer{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;min-width:0}
+.threer{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:16px;min-width:0}
 .appname{font-weight:600}
 
 @media(max-width:1100px){.cols{grid-template-columns:1fr}.rfcgrid{grid-template-columns:1fr}}
 @media(max-width:640px){
   main{padding:12px 10px 30px}header{padding:12px 12px}
-  .charts{grid-template-columns:1fr}
   .pod .url{display:none}
 }
 </style>
@@ -428,12 +431,12 @@ function podCard(d, kind) {
     };
     return '<div class="card pod"><div class="head">' + dot + '<span class="name">' + d.name +
       '</span><span class="url">' + d.url + sess + '</span></div>' +
-      '<div class="ifaces" style="grid-template-columns:1fr 1fr 1fr">' +
+      '<div class="ifaces tri">' +
       ["N3", "N5", "N9"].map(ifc).join("") + '</div></div>';
   }
   return '<div class="card pod"><div class="head">' + dot + '<span class="name">' + d.name +
     '</span><span class="url">' + d.url + '</span></div>' +
-    '<div class="ifaces" style="grid-template-columns:1fr"><div class="ifc">' +
+    '<div class="ifaces"><div class="ifc">' +
     '<div class="t c3">TX</div>' +
     '<div class="row"><span class="mut">sent</span><b>' + fmt(d.rates.TX_txPkts) + "/s</b></div>" +
     '<div class="row"><span class="mut">bw</span><b>' + fmt(d.rates.TX_txBytes) + "/s</b></div>" +
