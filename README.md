@@ -43,8 +43,8 @@ flowchart LR
 | Component | Role |
 |---|---|
 | **UPF** (`cmd/upf`) | The data plane. StatefulSet pod per node; decodes F-TEIDs, inspects every packet (SPI/DPI/policy), accounts usage, and forwards across the fabric over N9. |
-| **Traffic generator** (`cmd/trafficgen`) | Token-bucket GTP-U flows with realistic mock payloads (HTTP/SNI/DNS/QUIC). Dual-mode: in-cluster *or* external machine. Live 0–100 % throttle; RFC 2544 benchmarking (throughput, latency, loss, back-to-back). |
-| **Web UI** (`cmd/webui`) | Live dashboard; the **sole** PostgreSQL writer (metrics, SPI/DPI, CDRs, LI, UI state). State restored from the DB on refresh — zero data loss. |
+| **Traffic generator** (`cmd/trafficgen`) | Token-bucket GTP-U flows with realistic mock payloads (HTTP/SNI/DNS/QUIC). Dual-mode: in-cluster *or* external machine. Live 0–100 % throttle; **RFC 2544 benchmark runner** (loss ladder, throughput bisection, latency, back-to-back) on the live fabric. |
+| **Web UI** (`cmd/webui`) | Live dashboard + RFC 2544 panel (charts read the DB rows); the **sole** PostgreSQL writer (metrics, SPI/DPI, CDRs, LI, bench results, UI state). State restored from the DB on refresh — zero data loss. |
 | **Database** (PostgreSQL 16) | Durable store for all analytics and UI state, on a PVC. |
 
 The data plane never touches the database — reports flow `UPF → webui → DB`,
@@ -71,10 +71,24 @@ Useful local-only flows:
 ```bash
 make test           # go test ./... (unit + integration)
 make lint           # gofmt check + go vet (+ staticcheck when installed)
-make test-local     # full stack under podman (UPF + TG + webui + Postgres)
+make test-local     # full stack under podman: Postgres + 2 UPF + TG + webui
 make local-logs     # tail everything
 make local-down     # tear down the local stack
 ```
+
+`make test-local` pulls the RHEL9 PostgreSQL image on demand; when the local
+portal credentials are stale, point it at any pull secret with working
+`registry.redhat.io` auth (the cluster pull secret works):
+
+```bash
+make test-local DB_AUTHFILE=~/pull-secrets/cluster.json
+```
+
+then open `http://127.0.0.1:3080` (webui) and `http://127.0.0.1:3081`
+(generator API). Press **Start** in the RFC 2544 panel — results are
+upserted into Postgres with verified persistence and the four charts render
+from those rows. The full walkthrough, with one rendered proof per step,
+lives in [`docs/podman-demo.md`](docs/podman-demo.md).
 
 ### Required environment variables
 
@@ -87,6 +101,8 @@ make local-down     # tear down the local stack
 | `IMAGE_REGISTRY` / `IMAGE_OWNER` / `TAG` (opt) | build / push | image reference parts |
 | `PLATFORMS` (opt) | build / push | e.g. `linux/amd64,linux/arm64` for a multi-arch manifest |
 | `COMPONENTS` (opt) | build / push / images | subset, e.g. `upf trafficgen` |
+| `DB_AUTHFILE` (opt) | `make test-local` (DB pull) | authfile for pulling the RHEL9 PostgreSQL image |
+| `DB_IMAGE` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` (opt) | `make test-local` | local stack DB image and credentials (user default `upfgen`) |
 
 ---
 
@@ -127,9 +143,15 @@ DPI dashboard shows genuine app classification.
   session selector, bounded by a ring.
 * **Policy events** — every `observe`/`drop` decision with rule + 5-tuple.
 * **Metrics** — per-`(pod, iface)` counters and rates at a fixed cadence.
+* **RFC 2544 results** — every measurement point of every benchmark run, with
+  verify-then-seen persistence (a dropped write batch self-heals on the next
+  poll instead of losing the run).
 
 All of it is browsable in the Web UI, and every widget re-reads from the
-database on refresh.
+database on refresh — including the RFC 2544 charts (loss vs offered rate,
+zero-loss throughput, one-way latency, back-to-back), which render from the
+stored rows of the runs you trigger from the panel or a
+`POST /api/rfc2544`.
 
 ---
 
@@ -137,13 +159,14 @@ database on refresh.
 
 ```
 cmd/            upf · trafficgen · webui · e2e          (entrypoints)
-internal/       gtpu · upf · dpi · usage · traffic      (data plane + codecs)
+internal/       gtpu · upf · dpi · usage · traffic      (data plane + codecs + RFC 2544)
                 telemetry · web · dbstore               (metrics, UI, store)
 deploy/         OpenShift manifests (namespace, SCC, STS, Deployments,
                 Services, Route, PVC, ConfigMaps)
 local/          example YAML (local TG, external TG, policy profile)
-docs/           architecture.md (Mermaid) + notes
-makefile        all podman + oc automation   (*.Containerfile: UBI9 per component)
+docs/           architecture.md + podman-demo.md (Mermaid + rendered proofs)
+Makefile        all podman + oc automation   (*.Containerfile: UBI9 per component)
+.github/        build-and-push CI (test gate + parallel image matrix)
 ```
 
 Full package-by-package notes, the data-plane pipeline, the DB schema (er

@@ -37,7 +37,7 @@ Containerfile.
 | Component | Binary | Role | Scaled as |
 |---|---|---|---|
 | **UPF** | `cmd/upf` | The data plane. Listens for GTP-U on N3/N5/N9, resolves F-TEIDs, inspects (SPI/DPI/policy/CDR) and forwards across the fabric. | `StatefulSet` (1 pod per logical node) |
-| **Traffic generator** | `cmd/trafficgen` | Emits token-bucket GTP-U flows into the fabric's ingress ports; carries realistic mock payloads for DPI. Dual-mode (in-cluster / external). | `Deployment` (N pods) — or a standalone binary |
+| **Traffic generator** | `cmd/trafficgen` | Emits token-bucket GTP-U flows into the fabric's ingress ports; carries realistic mock payloads for DPI. Dual-mode (in-cluster / external). Doubles as the **RFC 2544 benchmark runner** (closed-loop on the live fabric). | `Deployment` (N pods) — or a standalone binary |
 | **Web UI** | `cmd/webui` | Fans out to every pod, renders the dashboard, and is the **only** process that writes to Postgres (metrics, SPI/DPI, CDRs, LI, UI state). | `Deployment` (1) |
 | **Database** | PostgreSQL 16 | Durable store for metrics, inspection results, usage and UI state. | `StatefulSet` (1) + PVC |
 
@@ -415,8 +415,8 @@ Every few seconds the webui fans out over HTTP to each endpoint:
 
 | Source | Endpoints polled | Purpose |
 |---|---|---|
-| UPF nodes | `/metrics`, `/api/teids`, `/api/dpi`, `/api/cdrs`, `/api/events/policy`, `/api/events/li` | counters, session info, DPI aggregates, one-shot drains |
-| traffic generators | `/metrics`, `/api/flows`, `/api/throttle` | TX counters, flow table, active knob |
+| UPF nodes | `/metrics`, `/api/teids`, `/api/dpi`, `/api/cdrs`, `/api/events/policy`, `/api/events/li`, `/api/dn-target` | counters, session info, DPI aggregates, one-shot drains, bench DN-target state |
+| traffic generators | `/metrics`, `/api/flows`, `/api/throttle`, `/api/rfc2544` | TX counters, flow table, active knob, finished benchmark runs |
 
 The dashboard itself is served by the webui (`/`). It polls `/api/stats` and
 `/api/topology` and renders the animated N3/N5/N9 fabric, per-interface rates
@@ -436,10 +436,17 @@ database. Each poll cycle it converts control-lite reports into store jobs:
   `li_events`;
 * **CDRs** — drained and upserted idempotently → `cdr`;
 * **heartbeats** — liveness + a small config snapshot per pod →
-  `node_heartbeat`.
+  `node_heartbeat`;
+* **RFC 2544 results** — finished benchmark runs of every generator →
+  `rfc2544_results` (§12).
 
 Writes are batched and buffered inside the store, so a database blip delays
-reporting but never blocks the poll loop or the data plane.
+reporting but never blocks the poll loop or the data plane. The store queue
+(4096 jobs, burst-drained up to 16 transaction-sized batches per tick) plus
+the **verify-then-seen** persistence rule for benchmark rows (a run is
+re-upserted until the stored row count matches its result count — the upsert
+is idempotent, so a dropped batch under queue pressure self-heals on the
+next poll) keep event bursts from losing measurement data.
 
 ### 8.3 State retention — zero loss on refresh
 
@@ -584,7 +591,30 @@ erDiagram
     jsonb value
     timestamptz updated_at
   }
+  rfc2544_results {
+    text run_id PK "part of unique key"
+    text test PK "loss | throughput | latency | back2back"
+    integer frame_size PK "G-PDU octets"
+    double offered_pps PK "offered frames/s"
+    text tg_pod
+    timestamptz ts
+    double offered_bps
+    bigint sent
+    bigint received
+    double loss_pct
+    double lat_min_us
+    double lat_avg_us
+    double lat_max_us
+    double lat_p50_us
+    double lat_p95_us
+    double lat_p99_us
+    bigint b2b_lossless
+  }
 ```
+
+The store ships as two idempotent migrations — `001_init.sql` (everything
+above except the benchmark table) and `002_rfc2544.sql` (§12) — replayed safe
+by `schema_migrations`.
 
 Design notes worth calling out:
 
@@ -593,7 +623,13 @@ Design notes worth calling out:
   chart. `dpi_summary` stores *deltas*, so row count is bounded by
   `pods × ifaces × apps × intervals`, not by packets.
 * **`policy_events`** is naturally low-rate (only policy hits land here).
-* **`li_events`** is bounded by the LI selector scope.
+* **`li_events`** is driven by the LI selector scope; the engine's ring is
+  bounded, but per-packet selection makes the persisted rate essentially
+  "traffic × poll cadence" — the store's burst-drain (up to 16 × 256 jobs per
+  5 s tick) is sized to keep that from saturating the write queue.
+* **`rfc2544_results`** is one row per offered-rate measurement point per
+  run; the PK makes the bridge's verify-then-seen re-upsert idempotent and
+  keeps history queryable per size and per procedure (§12).
 * **`cdr`** has a `UNIQUE (session_id, anchor_pod, started_at)` so the
   idempotent upsert in the bridge is safe under re-reporting.
 * **`ui_state`** is a tiny key/value JSONB table — the row that makes a
@@ -633,12 +669,15 @@ the authoritative reference.
 | `TG_ENDPOINTS` | *(empty)* | webui | `name=http://host:port,...` |
 | `WEBUI_AGG_INTERVAL` | `5s` | webui | bridge poll cadence |
 | `DB_DSN` | *(empty)* | webui | PostgreSQL DSN (empty = store disabled) |
-| `DB_MAX_CONNS` / `DB_FLUSH_MS` / `DB_QUEUE` | `4` / `2000` / `1024` | webui | pool / flush interval / job queue |
+| `DB_MAX_CONNS` / `DB_FLUSH_MS` / `DB_QUEUE` | `4` / `5000` / `4096` | webui | pool / flush interval / job queue (flush burst-drains ≤16 batches × 256 jobs per tick) |
+| `DB_AUTHFILE` | `~/.docker/config.json` | Makefile (local DB pull) | authfile used when `make test-local` pulls `DB_IMAGE` from registry.redhat.io |
 
 Global orchestration variables consumed by the **Makefile** (not by the Go
 binaries): `QUAY_USERNAME`, `QUAY_PASSWORD`, `KUBECONFIG`, plus overridables
 `NAMESPACE`, `IMAGE_REGISTRY`, `IMAGE_OWNER`, `TAG`, `PLATFORMS`,
-`COMPONENTS`, `DB_IMAGE`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`.
+`COMPONENTS`, `DB_IMAGE` (default `registry.redhat.io/rhel9/postgresql-16:latest`),
+`DB_AUTHFILE`, and the local-stack `DB_USER` (default `upfgen` — `postgres`
+is a built-in role in that image), `DB_PASSWORD`, `DB_NAME`.
 
 ---
 
@@ -698,45 +737,73 @@ Key properties:
 
 ---
 
-## 12. RFC 2544 benchmarking (roadmap — Phase 2)
+## 12. RFC 2544 benchmarking (implemented)
 
-The traffic generator is designed to *double* as a native **RFC 2544**
-frame-throughput / latency / loss / back-to-back benchmarking suite. The
-throughput-generating engine, the token-bucket throttle, the per-flow
-counters and the dual-mode addressing described here are the substrate that
-the benchmark harness will sit on.
+The traffic generator's token-bucket engine, per-flow counters and dual-mode
+addressing double as a native **RFC 2544** benchmarking suite. A run is a
+**closed loop on the live fabric**: the generator *pauses* its normal flows,
+claims the reserved top session sequence of the target node (`seq =
+sessions-1`) as its transceiver, injects G-PDU frames into that node's N3
+(direct UDP to the ingress port), and reads them back where the node delivers
+to the data network. The data-network egress is a **runtime switch** —
+`GET/POST /api/dn-target` on the UPF — which the bench points at its own RX
+socket for the run and restores afterwards ("locally anchored" mode: no N9
+usage, one node absorbs its own traffic).
+
+```
+bench frame (G-PDU, no seq-ext)
+┌──────────────┬──────────────────────────────┬───────────┬─────────────┐
+│ GTP hdr+TEID │ inner IPv4/UDP (real csums)  │ 8B index  │ 8B tx stamp │
+│              │                              │ + payload │ (ns, monot. │
+│              │                              │  filler   │  clock)     │
+└──────────────┴──────────────────────────────┴───────────┴─────────────┘
+```
+
+The RX side correlates by the 8-byte index (no per-packet timestamps in the
+outer header) and computes one-way latency from the monotonic transmit stamp.
+
+### 12.1 The four procedures
+
+| Procedure | Algorithm | Reported |
+|---|---|---|
+| **Frame loss rate** | log-ladder of offered rates from `min_rate`→`max_rate` (6 points, geometric steps; or explicit `candidate_rates`), each probe held for `duration_ms/2` (clamped 250–1500 ms) | `loss% = (sent-received)/sent` per rate × frame size |
+| **Throughput** | geometric (sqrt) bisect between the largest lossless ladder rate and `max_rate`, ≤10 probes, 5 % loss tolerance stop, then one confirmation run at the found rate | maximum zero-ish-loss offered rate + wire Mb/s |
+| **Latency** | light offered rate (`latency_rate`, default `min_rate`), `duration_ms` clamped 500–5000 ms, per-frame tx stamps | one-way min/avg/max and p50/p95/p99 |
+| **Back-to-back** | ascending unpaced bursts, stopping at the first lossy burst | longest lossless burst (frames) |
+
+A run follows the YAML/JSON **profile** (frame sizes × tests × rates). Runs
+are kept in generator memory (last 10) with their own `run_id`, status and
+progress; the control surface is proxied through the webui:
+
+```
+GET  /api/rfc2544               webui → rows read from Postgres (charts' source)
+GET  /api/rfc2544?lite=1        generator-side live status (no run history)
+POST /api/rfc2544               start run (profile body; forwarded to a generator)
+POST /api/rfc2544/cancel        stop the active run
+```
+
+### 12.2 Results persistence and rendering
 
 ```mermaid
 flowchart LR
-  subgraph R2544["RFC 2544 harness (Phase 2)"]
-    direction TB
-    P["YAML test profile\nframe sizes, durations,\ncandidate rates"]
-    T["**Throughput**\nbisection on offered rate\nuntil 0 loss"]
-    L["**Latency**\nper-frame TX/RX timestamps\nmin/avg/max, distribution"]
-    F["**Frame-loss rate**\noffered vs forwarded\n% vs rate curve"]
-    B["**Back-to-back**\nburst at min inter-frame gap\nlongest lossless burst"]
-    P --> T & L & F & B
-    T & L & F & B --> O["results -> rfc2544_results\n(history in Postgres)"]
+  subgraph GEN["traffic generator"]
+    T["bench engine"] --> R["run history\n(rfc2544 status)"]
   end
-  GEN["traffic generator\n(token-bucket, dual-mode)"] <== R2544
-  UI["Web UI\nRFC 2544 dashboard\ntrigger + graphs"] <==> GEN
+  W["webui bridge"] -- "poll finished runs" --> R
+  W -- "re-upsert until row count verified" --> PG[("PostgreSQL\nrfc2544_results")]
+  UI["RFC 2544 panel\n4 canvas charts"] -- "GET /api/rfc2544" --> PG
 ```
 
-Planned behaviour, so the shape is fixed now even before implementation:
-
-* **Throughput:** binary-search the offered rate at a fixed frame size,
-  reporting the maximum rate with *zero* dropped frames.
-* **Latency:** stamp frames at injection and (via an anchored return path) at
-  receipt, producing min/mean/max and a per-size distribution.
-* **Frame-loss rate:** sweep offered rates, plot `loss% = 1 - fwd/offered`
-  against rate and frame size.
-* **Back-to-back:** send a burst at the minimum inter-frame gap, measure the
-  longest lossless burst length.
-
-Results persist to a dedicated `rfc2544_results` table (Phase 2 migration) and
-are surfaced on a dedicated dashboard view with standard networking plots
-(latency histograms, loss-vs-rate/frame-size curves), alongside a live
-**trigger + progress** panel that drives the in-cluster generator.
+Every finished run's measurement points are bridged into the
+`rfc2544_results` table (primary key `(run_id, test, frame_size,
+offered_pps)`, idempotent `ON CONFLICT DO NOTHING` upsert, `ts` index). The
+bridge marks a run seen **only after counting the stored rows** — under
+queue pressure a dropped write batch is repaired on the next poll instead of
+being lost forever. The dashboard panel (loss curves on a log offered-rate
+axis, zero-loss throughput bars, latency min/avg/max, back-to-back bursts)
+renders **from those database rows**, so charts survive webui, generator and
+browser restarts, and a page refresh re-reads history the same way as all
+other analytics.
 
 ---
 
@@ -760,9 +827,11 @@ internal/
 deploy/           OpenShift manifests (Namespace, SCC, STS, Deployments,
                   Services, Routes, PVC, ConfigMaps)
 local/            example YAML configs (local / external TG, policy)
-docs/             this document + architecture (Mermaid)
-*.Containerfile   UBI9/UBI10 images per component
+docs/             architecture.md (+ Mermaid) and docs/podman-demo.md
+                  (live podman local-stack walkthrough with rendered proofs)
+*.Containerfile   UBI9 multi-stage images per component (dnf-only, uid 1001)
 Makefile          all podman + oc automation (help/lint/build/push/...)
+.github/          build-and-push CI (fmt/vet/test gate, parallel image matrix)
 ```
 
 The data-plane packages (`gtpu`, `upf`, `dpi`, `usage`, `traffic`) are
