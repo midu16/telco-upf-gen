@@ -1,13 +1,20 @@
 name: build-and-push
 
+# Every push to every branch runs the checks; pushed refs to the default
+# branch additionally roll the :latest tag. Each build is tagged with its
+# commit so any deployed environment can pin an exact change.
 on:
   push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target platforms (multi-arch adds slow QEMU builds)"
+        required: false
+        default: linux/amd64
 
 concurrency:
-  group: build-and-push
-  cancel-in-progress: false
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: quay.io
@@ -15,31 +22,55 @@ env:
 
 jobs:
   test:
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
+      - name: fmt (gofmt must leave the tree untouched)
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
         run: go vet ./...
+      - name: build binaries
+        run: go build ./...
       - name: test
         run: go test ./...
+        timeout-minutes: 5
 
-  build-push:
-    runs-on: ubuntu-latest
+  images:
     needs: test
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { app: upf, file: upf.Containerfile }
+          - { app: trafficgen, file: trafficgen.Containerfile }
+          - { app: webui, file: webui.Containerfile }
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: amd64,arm64
+      # Fail with an actionable message instead of docker/login-action's
+      # bare "Username and password required" (empty secrets resolve to
+      # empty strings; this makes the remediation obvious).
+      - name: Guard Quay credentials
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: |
+          if [ -z "$QUAY_USERNAME" ] || [ -z "$QUAY_PASSWORD" ]; then
+            echo "::error::Repository secrets 'QUAY_USERNAME' and 'QUAY_PASSWORD' are missing or empty."
+            echo "        Settings → Secrets and variables → Actions → New repository secret."
+            exit 1
+          fi
+          echo "Quay credentials present (user: $QUAY_USERNAME)"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -53,35 +84,27 @@ jobs:
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_PASSWORD }}
 
-      - name: Build and push upf (multi-arch)
-        uses: docker/build-push-action@v6
+      # One OCI image per commit: rolling branch tag + :latest on main +
+      # immutable sha-<commit> tag for pinning deployments.
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          context: .
-          file: upf.Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/upf:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.app }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push trafficgen (multi-arch)
+      - name: Build and push ${{ matrix.app }}
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: trafficgen.Containerfile
-          platforms: linux/amd64,linux/arm64
+          file: ${{ matrix.file }}
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/trafficgen:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build and push webui (multi-arch)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: webui.Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/webui:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,scope=${{ matrix.app }},mode=max
