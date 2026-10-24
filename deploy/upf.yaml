@@ -61,7 +61,7 @@ spec:
             periodSeconds: 15
           resources:
             requests: { cpu: 100m, memory: 128Mi }
-            limits: { cpu: "2", memory: 768Mi }
+            limits: { cpu: "8", memory: 768Mi }
 ---
 # Headless: every node gets A records for stable peer DNS.
 apiVersion: v1

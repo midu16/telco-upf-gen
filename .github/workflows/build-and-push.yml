@@ -72,6 +72,28 @@ jobs:
           fi
           echo "Quay credentials present (user: $QUAY_USERNAME)"
 
+      # Fail fast with an actionable message instead of the daemon's bare
+      # "401 Unauthorized" from login-action: probe the registry auth
+      # endpoint directly and verify the robot token + push scope for the
+      # image repos. Secrets are passed via --config stdin (not argv).
+      - name: Preflight Quay auth (token validity + push scope)
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          code=$(printf 'url = "https://quay.io/v2/auth?service=quay.io&scope=repository:%s/upf:push,pull"\nuser = "%s:%s"\n' \
+            "$IMAGE_OWNER" "$QUAY_USERNAME" "$QUAY_PASSWORD" \
+            | curl -sS -o /dev/null -w '%{http_code}' --config -) || code=000
+          if [ "$code" != "200" ]; then
+            echo "::error::quay.io rejected the stored credentials (HTTP $code)."
+            echo "  Use a Quay robot account: QUAY_USERNAME = owner+rname (e.g. ${IMAGE_OWNER}+ci),"
+            echo "  QUAY_PASSWORD = its token; regenerate the token on quay.io (Robot Accounts)"
+            echo "  and re-set both secrets, then re-run this workflow."
+            exit 1
+          fi
+          echo "quay.io auth OK: token valid, push scope granted for ${IMAGE_OWNER}/upf"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:

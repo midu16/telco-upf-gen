@@ -105,6 +105,8 @@ func fastProfile() BenchProfile {
 		MaxRate:     8000,
 		LatencyRate: 200,
 		B2BSizes:    []int{64, 512, 4096},
+		SendWorkers: 2, // exercise the concurrent send/receive paths
+		RxWorkers:   2,
 		Tests:       []BenchTest{TestLoss, TestThroughput, TestLatency, TestBackToBack},
 	}
 }

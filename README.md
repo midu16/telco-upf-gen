@@ -100,6 +100,57 @@ upserted into Postgres with verified persistence and the four charts render
 from those rows. The full walkthrough, with one rendered proof per step,
 lives in [`docs/podman-demo.md`](docs/podman-demo.md).
 
+#### High offered rates on the RFC 2544 panel
+
+The dashboard's "offered" numbers are true wire rate:
+
+```
+offered bit/s = offered pps × frame octets × 8
+```
+
+The stock profile (64/256/1518 octets, max_rate 250k pps) can therefore only
+offer ≈ **3 Gbps**. To chase 300–900 Gbps:
+
+| target | pps at 1518 B | pps at 9000 B | pps at 65000 B |
+|---|---|---|---|
+| 300 Gbps | 24.7 M | 4.17 M | 577 k |
+| 500 Gbps | 41.2 M | 6.94 M | 962 k |
+| 900 Gbps | 74.1 M | 12.5 M | 1.73 M |
+
+1. **Offer jumbo frames.** `frame_sizes: [65000]` cuts the pps requirement
+   two orders of magnitude. Every rate in the table is already expressible
+   in the profile (`max_rate` up to any pps; frame sizes 64..65000).
+2. **Partition the engine across cores** with the
+   `send_workers` / `rx_workers` profile keys (one independent UDP socket
+   and token bucket per sender; k receive loops on the sink). The deployed
+   defaults set 4/4 via `TG_BENCH_PROFILE` in `deploy/configmap.yaml`;
+   per-run overrides ride on the same API:
+3. Start from the panel (fill the frame-size and min/max‑rate fields) or:
+
+   ```sh
+   curl -sk -X POST https://<webui-route>/api/rfc2544 \
+     -H 'Content-Type: application/json' \
+     -d '{"frame_sizes":[65000],"min_rate":100000,"max_rate":2000000,
+          "duration_ms":2000,"send_workers":4,"rx_workers":4,
+          "tests":["loss","throughput"]}'
+   ```
+
+4. **Provision for it**: the engine is a Go kernel-socket path (no DPDK /
+   AF_XDP), so offering 1.7 Mpps × 65 KB ≈ 100+ GB/s of payload churn is
+   memory-bandwidth bound. Sustained machine CPUs/limits matter:
+   `deploy/trafficgen.yaml` and `deploy/upf.yaml` cpu limits plus
+   `UPF_WORKERS` (decap 8 workers by default) set the injection/decap
+   budget; scale `send_workers` with cores (each sender pushes
+   rate/k × size × 8 bit/s).
+
+The bisected **throughput** row you get back is the platform's measured
+lossless line rate at that frame size — assert against it, not against the
+manufacturer leaflets. For wire-grade 300–900 Gbps absorbed at a NIC, the
+generator process needs kernel-bypass delivery (DPDK/AF_XDP netmap class)
+or multi-host fan-out; the fabric topology section in
+[`docs/architecture.md`](docs/architecture.md) covers the multi-ingress
+paths that way.
+
 ### Required environment variables
 
 | Variable | Consumed by | Purpose |

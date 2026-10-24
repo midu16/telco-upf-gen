@@ -88,6 +88,15 @@ type BenchProfile struct {
 	// B2BSizes are candidate burst lengths (frame counts) for back-to-back,
 	// tried ascending; larger sizes are skipped once one bursts.
 	B2BSizes []int `yaml:"b2b_sizes"`
+	// SendWorkers parallelizes the sender: each worker owns an independent
+	// UDP socket to the anchor N3 (own kernel queue, own frame template)
+	// and a token-bucket share of `rate`. Data-driven so a deployment can
+	// scale offering with its CPU budget. 1 = historical single loop.
+	SendWorkers int `yaml:"send_workers"`
+	// RxWorkers parallelizes the receive side: k loops drain the shared
+	// sink socket, so a single goroutine cannot bottle the measurement.
+	// Should be >= SendWorkers at jumbo frames.
+	RxWorkers int `yaml:"rx_workers"`
 	// Tests selects the procedures; empty = all four.
 	Tests []BenchTest `yaml:"tests"`
 }
@@ -114,6 +123,18 @@ func (p *BenchProfile) setDefaults() {
 	}
 	if len(p.B2BSizes) == 0 {
 		p.B2BSizes = []int{256, 1024, 4096, 16384, 65536}
+	}
+	if p.SendWorkers <= 0 {
+		p.SendWorkers = 1
+	}
+	if p.RxWorkers <= 0 {
+		p.RxWorkers = 1
+	}
+	if p.SendWorkers > 64 {
+		p.SendWorkers = 64
+	}
+	if p.RxWorkers > 64 {
+		p.RxWorkers = 64
 	}
 	if len(p.Tests) == 0 {
 		p.Tests = append(p.Tests, allBenchTests...)
@@ -378,10 +399,17 @@ func (b *Bench) execute(ctx context.Context, run *BenchRun) {
 	total := len(sizes) * len(p.Tests)
 	done := 0
 	for _, size := range sizes {
-		fb, err := newFrameBuilder(e.teid, size)
-		if err != nil {
-			b.finish(run, err)
-			return
+		// One reusable wire template per send socket for this frame size;
+		// workers stamp their own copy (concurrent stamping must not share
+		// a buffer).
+		fbs := make([]*frameBuilder, len(e.conns))
+		for i := range fbs {
+			fb, err := newFrameBuilder(e.teid, size)
+			if err != nil {
+				b.finish(run, err)
+				return
+			}
+			fbs[i] = fb
 		}
 		for _, t := range p.Tests {
 			if ctx.Err() != nil {
@@ -389,7 +417,7 @@ func (b *Bench) execute(ctx context.Context, run *BenchRun) {
 				return
 			}
 			b.setPhase(run, fmt.Sprintf("%s @ %d octets", string(t), size), float64(done)/float64(total))
-			res, err := e.runTest(ctx, run, t, size, fb)
+			res, err := e.runTest(ctx, run, t, size, fbs)
 			if err != nil {
 				if ctx.Err() != nil {
 					b.finish(run, context.Canceled)
@@ -411,9 +439,9 @@ func (b *Bench) execute(ctx context.Context, run *BenchRun) {
 type runEngine struct {
 	deps BenchDeps
 
-	conn *net.UDPConn // bench egress: G-PDUs to the UPF N3 port
-	sink *net.UDPConn // receives the plain-IP frames the UPF egresses
-	teid uint32
+	conns []*net.UDPConn // bench egress sockets: G-PDUs to the UPF N3 port
+	sink  *net.UDPConn   // receives the plain-IP frames the UPF egresses
+	teid  uint32
 
 	rx         atomic.Uint64
 	collectLat atomic.Bool
@@ -460,20 +488,38 @@ func newRunEngine(deps BenchDeps, run *BenchRun) (*runEngine, func(), error) {
 		return nil, nil, fmt.Errorf("bench: set DN target: %w", err)
 	}
 
-	conn, err := net.DialUDP("udp", nil, dst)
-	if err != nil {
-		_, _ = deps.SetDNTarget(prev)
-		_ = sink.Close()
-		return nil, nil, fmt.Errorf("bench: dial N3 %s: %w", run.n3, err)
+	// One socket per send worker: independent kernel queues, no write-side
+	// contention, and the fabric sees k distinct 5-tuples (better hashing
+	// on intermediaries).
+	sendW := run.Profile.SendWorkers
+	if sendW < 1 {
+		sendW = 1
 	}
-	e.conn = conn
+	for i := 0; i < sendW; i++ {
+		conn, derr := net.DialUDP("udp", nil, dst)
+		if derr != nil {
+			_, _ = deps.SetDNTarget(prev)
+			for _, c := range e.conns {
+				_ = c.Close()
+			}
+			_ = sink.Close()
+			return nil, nil, fmt.Errorf("bench: dial N3 %s: %w", run.n3, derr)
+		}
+		e.conns = append(e.conns, conn)
+	}
 
-	go e.readLoop()
+	// The receive side scales the same way: k loops drain the shared sink
+	// socket, so no single goroutine bottlenecks a jumbo measurement.
+	for i := 0; i < run.Profile.RxWorkers; i++ {
+		go e.readLoop()
+	}
 
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
-			_ = conn.Close()
+			for _, c := range e.conns {
+				_ = c.Close()
+			}
 			_ = sink.Close()
 			if _, rerr := deps.SetDNTarget(prev); rerr != nil {
 				fmt.Printf("bench: restore DN target %q: %v\n", prev, rerr)
@@ -628,22 +674,38 @@ func (e *runEngine) drain() {
 	}
 }
 
-// pacedSend offers `rate` frames per second for `dur` using a token-bucket
-// tick (100us). Returns the number of frames actually written; a write
-// error aborts the measurement.
-func (e *runEngine) pacedSend(ctx context.Context, fb *frameBuilder, rate float64, dur time.Duration) (uint64, error) {
+// pacedSend offers `rate` frames per second for `dur`, split evenly across
+// the run's send sockets: worker i runs its own 100us-token-bucket loop at
+// rate/k on its own socket and frame template (concurrent stamping never
+// shares a buffer). Blocking writes make the senders self-throttle as the
+// kernel queues fill instead of erroring out. Returns the frames actually
+// offered; a write error or context cancellation aborts the measurement.
+func (e *runEngine) pacedSend(ctx context.Context, fbs []*frameBuilder, rate float64, dur time.Duration) (uint64, error) {
 	end := time.Now().Add(dur)
-	var sent uint64
-	carry := 0.0
+	var sent atomic.Uint64
+	share := rate / float64(len(e.conns))
+	err := e.sendJob(func(i int) error {
+		return paceWindow(ctx, e.conns[i], fbs[i], share, end, &sent)
+	})
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return sent.Load(), err
+}
+
+// paceWindow is one sender's token-bucket loop (100us tick): offer frames
+// at the given rate share until `end`, counting into `sent`.
+func paceWindow(ctx context.Context, conn *net.UDPConn, fb *frameBuilder, rate float64, end time.Time, sent *atomic.Uint64) error {
+	var carry float64
 	last := time.Now()
 	for {
 		now := time.Now()
 		if now.After(end) {
-			return sent, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return sent, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 		carry += rate * now.Sub(last).Seconds()
@@ -652,16 +714,41 @@ func (e *runEngine) pacedSend(ctx context.Context, fb *frameBuilder, rate float6
 		carry -= float64(n)
 		for i := 0; i < n; i++ {
 			fb.stamp()
-			if _, err := e.conn.Write(fb.tmpl); err != nil {
-				return sent, err
+			if _, err := conn.Write(fb.tmpl); err != nil {
+				return err
 			}
-			sent++
+			sent.Add(1)
 		}
 		next := last.Add(100 * time.Microsecond)
 		if time.Until(next) > 0 && next.Before(end) {
 			time.Sleep(time.Until(next))
 		}
 	}
+}
+
+// sendJob runs fn(i) once per send socket, concurrently; returns the first
+// error observed (nil when every job succeeds) after all jobs complete.
+func (e *runEngine) sendJob(fn func(i int) error) error {
+	errch := make(chan error, len(e.conns))
+	var wg sync.WaitGroup
+	for i := range e.conns {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(i); err != nil {
+				errch <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errch)
+	for err := range errch {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // settle waits until the sink has received `expect` frames since base (full
@@ -715,18 +802,18 @@ func (e *runEngine) result(run *BenchRun, t BenchTest, size int, rate float64, s
 	return r
 }
 
-// runTest dispatches one procedure. fb is reused across tests of the same
-// size; each test owns its own drained receive window.
-func (e *runEngine) runTest(ctx context.Context, run *BenchRun, t BenchTest, size int, fb *frameBuilder) ([]BenchResult, error) {
+// runTest dispatches one procedure. fbs[i] is socket i's reusable template
+// for this size; each test owns its own drained receive window.
+func (e *runEngine) runTest(ctx context.Context, run *BenchRun, t BenchTest, size int, fbs []*frameBuilder) ([]BenchResult, error) {
 	switch t {
 	case TestLoss:
-		return e.testLoss(ctx, run, size, fb)
+		return e.testLoss(ctx, run, size, fbs)
 	case TestThroughput:
-		return e.testThroughput(ctx, run, size, fb)
+		return e.testThroughput(ctx, run, size, fbs)
 	case TestLatency:
-		return e.testLatency(ctx, run, size, fb)
+		return e.testLatency(ctx, run, size, fbs)
 	case TestBackToBack:
-		return e.testBackToBack(ctx, run, size, fb)
+		return e.testBackToBack(ctx, run, size, fbs)
 	default:
 		return nil, fmt.Errorf("bench: unknown test %q", t)
 	}
@@ -768,7 +855,7 @@ func clampDur(ms, lo, hi int64) time.Duration {
 }
 
 // testLoss sweeps the offered rates and reports loss% per rate.
-func (e *runEngine) testLoss(ctx context.Context, run *BenchRun, size int, fb *frameBuilder) ([]BenchResult, error) {
+func (e *runEngine) testLoss(ctx context.Context, run *BenchRun, size int, fbs []*frameBuilder) ([]BenchResult, error) {
 	probe := probeWindow(run.Profile)
 	out := make([]BenchResult, 0, len(run.Profile.CandidateRates)+6)
 	for _, rate := range lossRates(run.Profile) {
@@ -777,7 +864,7 @@ func (e *runEngine) testLoss(ctx context.Context, run *BenchRun, size int, fb *f
 		}
 		e.drain()
 		base := e.rx.Load()
-		sent, err := e.pacedSend(ctx, fb, rate, probe)
+		sent, err := e.pacedSend(ctx, fbs, rate, probe)
 		if err != nil {
 			return out, err
 		}
@@ -789,13 +876,13 @@ func (e *runEngine) testLoss(ctx context.Context, run *BenchRun, size int, fb *f
 
 // testThroughput bisects geometrically between MinRate and MaxRate for the
 // maximum offered rate with zero loss.
-func (e *runEngine) testThroughput(ctx context.Context, run *BenchRun, size int, fb *frameBuilder) ([]BenchResult, error) {
+func (e *runEngine) testThroughput(ctx context.Context, run *BenchRun, size int, fbs []*frameBuilder) ([]BenchResult, error) {
 	p := run.Profile
 	probe := probeWindow(p)
 	measure := func(rate float64) (sent, got uint64, err error) {
 		e.drain()
 		base := e.rx.Load()
-		sent, err = e.pacedSend(ctx, fb, rate, probe)
+		sent, err = e.pacedSend(ctx, fbs, rate, probe)
 		if err != nil {
 			return sent, 0, err
 		}
@@ -838,7 +925,7 @@ func (e *runEngine) testThroughput(ctx context.Context, run *BenchRun, size int,
 }
 
 // testLatency measures one-way delay at a light fixed rate.
-func (e *runEngine) testLatency(ctx context.Context, run *BenchRun, size int, fb *frameBuilder) ([]BenchResult, error) {
+func (e *runEngine) testLatency(ctx context.Context, run *BenchRun, size int, fbs []*frameBuilder) ([]BenchResult, error) {
 	dur := clampDur(int64(run.Profile.DurationMs), 500, 5000)
 	e.drain()
 	e.resetLats()
@@ -846,7 +933,7 @@ func (e *runEngine) testLatency(ctx context.Context, run *BenchRun, size int, fb
 	defer e.collectLat.Store(false)
 
 	base := e.rx.Load()
-	sent, err := e.pacedSend(ctx, fb, run.Profile.LatencyRate, dur)
+	sent, err := e.pacedSend(ctx, fbs, run.Profile.LatencyRate, dur)
 	if err != nil {
 		return nil, err
 	}
@@ -872,7 +959,7 @@ func (e *runEngine) testLatency(ctx context.Context, run *BenchRun, size int, fb
 
 // testBackToBack sends unpaced bursts of ascending candidate sizes and
 // reports the largest burst delivered without loss.
-func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int, fb *frameBuilder) ([]BenchResult, error) {
+func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int, fbs []*frameBuilder) ([]BenchResult, error) {
 	sizes := append([]int(nil), run.Profile.B2BSizes...)
 	sort.Ints(sizes)
 
@@ -884,10 +971,8 @@ func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int,
 		}
 		e.drain()
 		base := e.rx.Load()
-		for i := 0; i < b; i++ {
-			if _, err := e.conn.Write(fb.tmpl); err != nil {
-				return nil, err
-			}
+		if err := e.burst(fbs, b); err != nil {
+			return nil, err
 		}
 		sent = uint64(b)
 		got = e.settle(ctx, base, sent)
@@ -900,6 +985,26 @@ func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int,
 	r := e.result(run, TestBackToBack, size, 0, sent, got)
 	r.B2BLossless = lossless
 	return []BenchResult{r}, nil
+}
+
+// burst fires exactly n frames across the send sockets in parallel with no
+// pacing — the RFC 2544 back-to-back frames condition. Balance is exact:
+// each socket shares n/k plus one for the first n%k workers.
+func (e *runEngine) burst(fbs []*frameBuilder, n int) error {
+	return e.sendJob(func(i int) error {
+		conn, fb := e.conns[i], fbs[i]
+		share := n / len(e.conns)
+		if i < n%len(e.conns) {
+			share++
+		}
+		for j := 0; j < share; j++ {
+			fb.stamp()
+			if _, err := conn.Write(fb.tmpl); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // percentile returns the q-quantile (0..1] of a sorted slice.

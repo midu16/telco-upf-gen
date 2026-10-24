@@ -28,7 +28,7 @@ data:
   # serves the default CNI (pod/Service IP), secondary Multus networks and
   # NodePort/LB DNATs at once.
   UPF_SESSIONS: "256"
-  UPF_WORKERS: "4"
+  UPF_WORKERS: "8"
   DN_TARGET: ""
   # SPI/DPI + usage analytics
   UPF_INSPECTION: "true"
@@ -55,6 +55,14 @@ data:
   # injection
   TG_PPS: "100"
   TG_MAX_SESSIONS: "32"
+  # RFC 2544 stock profile (JSON — a YAML subset). Offered Gbps on the
+  # dashboard = rate pps x frame octets x 8 (1.73M pps @ 65000B ~ 900 Gbps
+  # offered; the throughput bisection then reports the lossless achievable).
+  # send/rx workers partition the bench send/receive windows across cores.
+  TG_BENCH_PROFILE: >-
+    {"frame_sizes": [1518, 9000, 65000], "min_rate": 2000,
+     "max_rate": 2000000, "duration_ms": 2000,
+     "send_workers": 4, "rx_workers": 4}
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -849,6 +849,16 @@ outer header) and computes one-way latency from the monotonic transmit stamp.
 | **Latency** | light offered rate (`latency_rate`, default `min_rate`), `duration_ms` clamped 500–5000 ms, per-frame tx stamps | one-way min/avg/max and p50/p95/p99 |
 | **Back-to-back** | ascending unpaced bursts, stopping at the first lossy burst | longest lossless burst (frames) |
 
+Offered bit/s = pps × frame octets × 8, so offered Gbps on the dashboard is
+the product of the rate window and the frame size (1.73 Mpps × 65000 octets
+≈ 900 Gbps offered). The engine is scalable per profile: `send_workers`
+gives each sender its own N3 socket and token-bucket share, `rx_workers`
+spawns receive loops on the sink; the deployment default (4/4) rides in
+`TG_BENCH_PROFILE` on `deploy/configmap.yaml`. Because the path is Go
+kernel sockets (no DPDK/AF_XDP), the achievable lossless rate — what the
+throughput bisection reports — is memory-bandwidth bound; scale the workers
+with `deploy/*.yaml` CPU limits and `UPF_WORKERS`.
+
 A run follows the YAML/JSON **profile** (frame sizes × tests × rates). Runs
 are kept in generator memory (last 10) with their own `run_id`, status and
 progress; the control surface is proxied through the webui:

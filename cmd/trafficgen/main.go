@@ -38,6 +38,7 @@ import (
 	"github.com/midu/telco-upf-gen/internal/telemetry"
 	"github.com/midu/telco-upf-gen/internal/traffic"
 	"github.com/midu/telco-upf-gen/internal/upf"
+	"gopkg.in/yaml.v3"
 )
 
 // fabricNode is one addressed UPF endpoint (discovered or explicit).
@@ -132,6 +133,16 @@ func loadResolvedConfig(cfgPath, name, peerDNS string, nodes, metricsPort int, p
 	}
 	if v := envIntOr("TG_MAX_SESSIONS", 0); v > 0 {
 		rc.MaxSess = v
+	}
+	// Bench profile defaults (JSON; a YAML subset) so a deployment scales
+	// the RFC 2544 stock profile (frame sizes, rate window, send/receive
+	// workers) without shipping a config file.
+	if v := strings.TrimSpace(os.Getenv("TG_BENCH_PROFILE")); v != "" {
+		var bp traffic.BenchProfile
+		if err := yaml.Unmarshal([]byte(v), &bp); err != nil {
+			return nil, fmt.Errorf("trafficgen: TG_BENCH_PROFILE: %w", err)
+		}
+		rc.Bench = bp
 	}
 
 	if cfgPath != "" {
@@ -392,6 +403,8 @@ type benchRequest struct {
 	MaxRate        float64   `json:"max_rate"`
 	DurationMs     int       `json:"duration_ms"`
 	B2BSizes       []int     `json:"b2b_sizes"`
+	SendWorkers    int       `json:"send_workers"`
+	RxWorkers      int       `json:"rx_workers"`
 	Tests          []string  `json:"tests"`
 	Node           *int      `json:"node"`
 }
@@ -453,6 +466,12 @@ func rfc2544(bench *traffic.Bench, upfs []fabricNode) http.HandlerFunc {
 			}
 			if len(req.B2BSizes) > 0 {
 				p.B2BSizes = req.B2BSizes
+			}
+			if req.SendWorkers > 0 {
+				p.SendWorkers = req.SendWorkers
+			}
+			if req.RxWorkers > 0 {
+				p.RxWorkers = req.RxWorkers
 			}
 			if len(req.Tests) > 0 {
 				ts := make([]traffic.BenchTest, 0, len(req.Tests))
