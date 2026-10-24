@@ -38,7 +38,12 @@ seLinuxContext:
   type: RunAsAny
 supplementalGroups:
   type: RunAsAny
-users:
+# SCC subject grant lives under `groups`: `system:serviceaccounts:<ns>` is a
+# pseudo-group. Under `users:` newer OpenShift SCC subject-type validation
+# ignores group-shaped values and admission then reports the whole SCC as
+# "not usable by user or serviceaccount" (observed after an SCC delete+reapply
+# during a from-scratch redeploy on k8s v1.36).
+groups:
   - system:serviceaccounts:telco
 volumes:
   - configMap
