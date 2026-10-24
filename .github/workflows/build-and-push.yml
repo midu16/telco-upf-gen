@@ -99,12 +99,27 @@ jobs:
         with:
           driver-opts: network=host
 
-      - name: Log in to Quay
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+      # Retrying login: docker/login-action@v3 has no retry, and quay's
+      # auth endpoint has shown transient 401/503s under parallel matrix
+      # logins (run #11: identical creds logged in fine on the upf job
+      # while the other two hit a 503/401 race).
+      - name: Log in to Quay (retry)
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if echo "$QUAY_PASSWORD" | docker login "${{ env.REGISTRY }}" \
+              --username "$QUAY_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            echo "attempt $attempt failed — quay-side hiccup, retrying in 20s"
+            sleep 20
+          done
+          echo "::error::quay.io login failed after 5 attempts. If the preflight above passed,"
+          echo "  this is a quay-side outage/rate problem — re-run the job; if it persists,"
+          echo "  regenerate the robot token and re-set the QUAY_* secrets."
+          exit 1
 
       # One OCI image per commit: rolling branch tag + :latest on main +
       # immutable sha-<commit> tag for pinning deployments.
