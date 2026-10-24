@@ -68,10 +68,15 @@ help:
 	@echo "  -----------------------------------------------------"
 	@grep -hE '^## ' $(MAKEFILE_LIST) | sed 's/^## /\    /'
 	@echo ""
+	@echo "  Cross-CNI validation:"
+	@echo "    make deploy-multus     # NADs + pod annotations (Multus nets)"
+	@echo "    make e2e E2E_EXTERNAL_ADDR=<node-ip>:32152  # NodePort GTP-U ingress (svc upf-ext)"
+	@echo ""
 	@echo "  Required environment:"
 	@echo "    QUAY_USERNAME   Quay user (push)      [default: midu]"
 	@echo "    QUAY_PASSWORD   Quay token/password   (push)"
 	@echo "    KUBECONFIG      kubeconfig file       (deploy, e2e)"
+	@echo "    E2E_EXTERNAL_ADDR  optional node:Port for the cross-CNI e2e check"
 	@echo ""
 	@echo "  Example:"
 	@echo "    export QUAY_PASSWORD=*** KUBECONFIG=/path/to/kubeconfig"
@@ -81,9 +86,9 @@ help:
 # ---------------------------------------------------------- validation
 
 define check_env
-	@if [ -z "$$($(1))" ]; then \
-		echo "ERROR: \$$($(1)) is not set"; \
-		echo "  export $($(1))=*** && $0 $(2)"; \
+	@if [ -z "$($(1))" ]; then \
+		echo "ERROR: $(1) is not set (export it first)"; \
+		echo "  example: export $(1)=*** && make $(2)"; \
 		exit 1; \
 	fi
 endef
@@ -272,6 +277,65 @@ undeploy:
 	@$(OC) delete -f deploy/ --ignore-not-found
 	@echo "==> deployment removed (namespace $(NAMESPACE))"
 
+# ------------------------------------------------------------ multi-CNI (Multus)
+
+## deploy-multus: attach the UPF+TG pods to secondary Multus networks (distinct-CNI topology)
+deploy-multus:
+	$(call check_env,KUBECONFIG,deploy-multus)
+	@echo "==> network attachment definitions (deploy/multus.yaml)"
+	@$(OC) apply -f deploy/multus.yaml
+	@echo "==> pod-template annotations (StatefulSets roll automatically)"
+	@$(OC) -n $(NAMESPACE) patch sts upf --type merge -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":"upf-data"}}}}}'
+	@$(OC) -n $(NAMESPACE) patch sts trafficgen --type merge -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":"tg-data"}}}}}'
+	@-$(OC) -n $(NAMESPACE) rollout status sts/upf --timeout=3m
+	@-$(OC) -n $(NAMESPACE) rollout status sts/trafficgen --timeout=3m
+	@echo "==> attached; attachment IP on upf-0/net1:"
+	@-$(OC) -n $(NAMESPACE) exec upf-0 -- ip -4 addr show net1
+
+## undeploy-multus: remove the Multus attachments (annotations cleared, NADs kept)
+undeploy-multus:
+	$(call check_env,KUBECONFIG,undeploy-multus)
+	@$(OC) -n $(NAMESPACE) patch sts upf --type merge -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":null}}}}}'
+	@$(OC) -n $(NAMESPACE) patch sts trafficgen --type merge -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":null}}}}}'
+	@echo "==> attachments cleared (pods roll back to the default CNI)"
+
+# --------------------------------------------------------------- storage
+
+# Repo-owned StorageClass alias name (must not clash with provider names).
+LOCAL_SC ?= telco-upf-local
+
+## storage-default: mark a StorageClass as the cluster default (STORAGE_CLASS=lvms-vg1)
+## Required for deploy/db.yaml: the PVC/template is deliberately SC-agnostic
+## (no hardcoded provisioner name) and binds against the cluster default.
+storage-default:
+	$(call check_env,KUBECONFIG,storage-default)
+	@if [ -z "$(STORAGE_CLASS)" ]; then echo "ERROR: set STORAGE_CLASS (e.g. make storage-default STORAGE_CLASS=lvms-vg1)"; exit 1; fi
+	@echo "==> marking $(STORAGE_CLASS) the default storage class"
+	@$(OC) patch storageclass $(STORAGE_CLASS) \
+		-p '{"metadata": {"annotations": {"storageclass.kubernetes.io/is-default-class": "true"}}}'
+	@$(OC) get sc
+
+## storage-sc: clone SOURCE_SC=<existing sc> into the repo-owned alias
+## $(LOCAL_SC) and mark the alias default. Use when the operator owns the
+## original annotations (e.g. LVM Storage), and `make storage-default` keeps
+## being reverted.
+storage-sc:
+	$(call check_env,KUBECONFIG,storage-sc)
+	@if [ -z "$(SOURCE_SC)" ]; then echo "ERROR: set SOURCE_SC (e.g. make storage-sc SOURCE_SC=lvms-vg1)"; exit 1; fi
+	@echo "==> cloning storage class $(SOURCE_SC) -> $(LOCAL_SC) (default-sc alias)"
+	@$(OC) get storageclass "$(SOURCE_SC)" -o json \
+	  | python3 -c 'import json,sys; s=json.load(sys.stdin); \
+o={"apiVersion":"storage.k8s.io/v1","kind":"StorageClass",\
+"metadata":{"name":"$(LOCAL_SC)","labels":{"app.kubernetes.io/part-of":"telco-upf-gen"}},\
+"provisioner":s["provisioner"],"reclaimPolicy":s.get("reclaimPolicy","Delete"),\
+"volumeBindingMode":s.get("volumeBindingMode","Immediate"),\
+"allowVolumeExpansion":s.get("allowVolumeExpansion",False),\
+"mountOptions":s.get("mountOptions",[]),"parameters":s.get("parameters",{})}; \
+o["metadata"]["annotations"]={"storageclass.kubernetes.io/is-default-class":"true"}; \
+print(json.dumps(o))' | $(OC) apply -f -
+	@$(OC) get sc
+	@echo "==> $(LOCAL_SC) is the default; PVCs without a storageClassName bind here"
+
 ## pods: quick status of the live stack
 pods:
 	$(call check_env,KUBECONFIG,pods)
@@ -297,4 +361,4 @@ e2e: bin
 clean:
 	rm -rf $(BIN) $(AUTH)
 	@echo "==> cleaned"
-.PHONY: help lint tidy test fmt bin build images image login push test-local local-down local-logs deploy undeploy pods route e2e clean
+.PHONY: help lint tidy test fmt bin build images image login push test-local local-down local-logs deploy undeploy deploy-multus undeploy-multus storage-default storage-sc pods route e2e clean

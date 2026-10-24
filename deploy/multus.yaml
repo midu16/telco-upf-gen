@@ -1,0 +1,61 @@
+# Optional secondary CNI networks (Multus) for the "distinct CNI" topology:
+# generator and dataplane pods attach their own L2/L3 island, simulated on
+# separate /24s from the default CNI — same-CNI traffic keeps working in
+# parallel (flat vs multi-network routing). Requires the whereabouts IPAM
+# plugin (shipped with OpenShift >= 4.9 as a default CNI component; check
+# with `oc get -n <namespace> net-attach-def` once created).
+#
+# Apply + attach with:
+#   make deploy-multus     # NADs + pod-template annotations (STS rollout)
+#
+# The UPF needs no configuration change in the common case: its listeners
+# wildcard-bind, so they accept the secondary CIDR on `net1` the same way
+# they accept the default pod IP. To pin a listener to the attachment IP
+# instead (strict source-interface routing when the platform routes the
+# secondary CIDR away from the default gut), set `N3_BIND`/`N5_BIND`/`N9_BIND`
+# in deploy/configmap.yaml — resolve the IP from
+# `oc -n telco exec <pod> -- ip -4 addr show net1` and update the ConfigMap.
+#
+# Same-subnet alternative (avoids node-level routes between islands): set the
+# NAD2 range below to 10.60.0.0/24 as well. With the two /24s kept separate,
+# route discovery rides on the whereabouts gateway ('gateway' field) that CNI
+# wires to the host bridge.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: upf-data
+  namespace: telco
+  labels:
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  config: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "upf-data",
+      "type": "whereabouts",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "10.60.0.0/24",
+        "exclude": ["10.60.0.1/32"]
+      }
+    }
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: tg-data
+  namespace: telco
+  labels:
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  config: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "tg-data",
+      "type": "whereabouts",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "10.61.0.0/24",
+        "exclude": ["10.61.0.1/32"]
+      }
+    }

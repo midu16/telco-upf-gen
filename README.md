@@ -63,7 +63,10 @@ make                # menu of all targets
 make build          # Go binaries + UBI9 Podman images
 make push           # login to Quay (QUAY_USERNAME/QUAY_PASSWORD) + push
 make deploy         # oc apply -f deploy/ against $KUBECONFIG
+make deploy-multus  # optional: attach UPF+TG pods to secondary Multus networks
 make e2e            # live-cluster end-to-end suite
+export E2E_EXTERNAL_ADDR=<node-ip>:32152 && make e2e   # adds the cross-CNI
+                                    # NodePort-ingress check (svc upf-ext)
 ```
 
 > The `db` StatefulSet (`deploy/db.yaml`) uses the
@@ -109,6 +112,7 @@ lives in [`docs/podman-demo.md`](docs/podman-demo.md).
 | `PLATFORMS` (opt) | build / push | e.g. `linux/amd64,linux/arm64` for a multi-arch manifest |
 | `COMPONENTS` (opt) | build / push / images | subset, e.g. `upf trafficgen` |
 | `DB_AUTHFILE` (opt) | `make test-local` (DB pull) | authfile for pulling the RHEL9 PostgreSQL image |
+| `E2E_EXTERNAL_ADDR` (opt) | `make e2e` | `<node-ip>:<n3NodePort>` — drives real G-PDUs into the `upf-ext` NodePort ingress (cross-CNI check). Omit = check skipped |
 | `DB_IMAGE` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` (opt) | `make test-local` | local stack DB image and credentials (user default `upfgen`) |
 
 ---

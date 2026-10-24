@@ -32,9 +32,17 @@ type Config struct {
 	N3Port          int
 	N5Port          int
 	N9Port          int
-	Sessions        int
-	DNTarget        string // "host:port" for plain-IP delivery; empty = count only
-	Workers         int
+	// Per-interface bind addresses ("" = IPv4 wildcard 0.0.0.0). The wildcard
+	// is what makes one socket serve every CNI at once: default-network pod
+	// and Service traffic, a Multus secondary-network IP, and NodePort /
+	// LoadBalancer DNATs. Pin a bind IP when the platform requires an
+	// explicit interface for a CIDR (e.g. N3 on the `upf-data` network).
+	N3Bind   string
+	N5Bind   string
+	N9Bind   string
+	Sessions int
+	DNTarget string // "host:port" for plain-IP delivery; empty = count only
+	Workers  int
 
 	// SPI/DPI pipeline (Inspection=false disables it entirely; the data
 	// plane then forwards without inspection, zero overhead).
@@ -118,7 +126,26 @@ func (u *UPF) Teids() map[string]any {
 			"n5": u.cfg.N5Port,
 			"n9": u.cfg.N9Port,
 		},
+		// Per-interface bind IPs (diagnostic; empty = wildcard). Additive —
+		// consumers decode strictly known fields.
+		"binds": map[string]string{
+			"n3": u.cfg.N3Bind,
+			"n5": u.cfg.N5Bind,
+			"n9": u.cfg.N9Bind,
+		},
 	}
+}
+
+// parseBind validates a per-interface bind address; empty = IPv4 wildcard.
+func parseBind(s string) (net.IP, error) {
+	if s == "" {
+		return net.IPv4zero, nil
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil, fmt.Errorf("upf: bad bind address %q (expect a host IP)", s)
+	}
+	return ip, nil
 }
 
 // n9Addr resolves (and caches) a peer node's N9 endpoint.
@@ -263,11 +290,20 @@ func (u *UPF) Run(ctx context.Context) error {
 	}
 	ifaces := []struct {
 		name string
+		bind string
 		port int
 	}{
-		{"N3", u.cfg.N3Port},
-		{"N5", u.cfg.N5Port},
-		{"N9", u.cfg.N9Port},
+		{"N3", u.cfg.N3Bind, u.cfg.N3Port},
+		{"N5", u.cfg.N5Bind, u.cfg.N5Port},
+		{"N9", u.cfg.N9Bind, u.cfg.N9Port},
+	}
+	binds := make(map[string]net.IP, len(ifaces))
+	for _, ifc := range ifaces {
+		ip, err := parseBind(ifc.bind)
+		if err != nil {
+			return err
+		}
+		binds[ifc.name] = ip
 	}
 
 	queue := make(chan job, 8192)
@@ -290,14 +326,18 @@ func (u *UPF) Run(ctx context.Context) error {
 	errc := make(chan error, len(ifaces))
 	for _, ifc := range ifaces {
 		wg.Add(1)
-		go func(name string, port int) {
+		go func(name string, bind net.IP, port int) {
 			defer wg.Done()
-			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bind, Port: port})
 			if err != nil {
 				errc <- fmt.Errorf("upf: listen %s: %w", name, err)
 				return
 			}
-			log.Printf("upf %s: %s ready on udp/:%d", u.cfg.NodeName, name, port)
+			where := bind.String()
+			if bind.Equal(net.IPv4zero) {
+				where = "0.0.0.0 (every CNI: default net / Multus / NodePort-LB)"
+			}
+			log.Printf("upf %s: %s ready on udp/%s:%d", u.cfg.NodeName, name, where, port)
 			defer conn.Close()
 
 			// Reads run on a short deadline so ctx cancellation always
@@ -337,7 +377,7 @@ func (u *UPF) Run(ctx context.Context) error {
 					return
 				}
 			}
-		}(ifc.name, ifc.port)
+		}(ifc.name, binds[ifc.name], ifc.port)
 	}
 
 	select {

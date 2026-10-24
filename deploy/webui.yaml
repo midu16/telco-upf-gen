@@ -31,25 +31,18 @@ spec:
       containers:
         - name: webui
           image: quay.io/midu/webui:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - { name: http, containerPort: 8080, protocol: TCP }
           env:
-            - name: ADDR
-              value: ":8080"
-            - name: UPF_ENDPOINTS
-              value: >-
-                upf-0=http://upf-0.upf-hs.telco.svc.cluster.local:8080,
-                upf-1=http://upf-1.upf-hs.telco.svc.cluster.local:8080
-            - name: TG_ENDPOINTS
-              value: >-
-                tg-0=http://trafficgen-0.tg-hs.telco.svc.cluster.local:8080,
-                tg-1=http://trafficgen-1.tg-hs.telco.svc.cluster.local:8080
-            # Sole store writer. Keep in sync with deploy/db.yaml envs
-            # (POSTGRESQL_USER/POSTGRESQL_PASSWORD/POSTGRESQL_DATABASE) and
-            # the Makefile / e2e defaults (DB_USER/DB_PASSWORD/DB_NAME).
+            # DB_DSN is the only store credential; keep it in sync with the
+            # POSTGRESQL_* envs in deploy/db.yaml and the Makefile/e2e
+            # defaults (DB_USER=upfgen, DB_PASSWORD=postgres, DB_NAME=telco_upf).
             - name: DB_DSN
               value: postgres://upfgen:postgres@db.telco.svc.cluster.local:5432/telco_upf?sslmode=disable
+          envFrom:
+            - configMapRef:
+                name: webui-env
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2

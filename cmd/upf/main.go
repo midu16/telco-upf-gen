@@ -31,6 +31,9 @@ func main() {
 	n3port := flag.Int("n3-port", envIntOr("N3_PORT", 2152), "N3 GTP-U UDP port (gNB direction)")
 	n5port := flag.Int("n5-port", envIntOr("N5_PORT", 2153), "N5 GTP-U UDP port (DN direction)")
 	n9port := flag.Int("n9-port", envIntOr("N9_PORT", 2154), "N9 GTP-U UDP port (peer UPF direction)")
+	n3bind := flag.String("n3-bind", envOr("N3_BIND", ""), "N3 listener bind IP (empty = wildcard / every CNI)")
+	n5bind := flag.String("n5-bind", envOr("N5_BIND", ""), "N5 listener bind IP (empty = wildcard / every CNI)")
+	n9bind := flag.String("n9-bind", envOr("N9_BIND", ""), "N9 listener bind IP (empty = wildcard / every CNI)")
 	sessions := flag.Int("sessions", envIntOr("UPF_SESSIONS", 256), "shared F-TEID session space per node")
 	workers := flag.Int("workers", envIntOr("UPF_WORKERS", 4), "per-node forwarding worker goroutines")
 	dnTarget := flag.String("dn-target", envOr("DN_TARGET", ""),
@@ -60,6 +63,9 @@ func main() {
 		N3Port:          *n3port,
 		N5Port:          *n5port,
 		N9Port:          *n9port,
+		N3Bind:          *n3bind,
+		N5Bind:          *n5bind,
+		N9Bind:          *n9bind,
 		Sessions:        *sessions,
 		DNTarget:        *dnTarget,
 		Workers:         *workers,
@@ -72,6 +78,11 @@ func main() {
 	})
 	log.Printf("upf %s: node %d of %d — N3 udp/:%d N5 udp/:%d N9 udp/:%d, %d sessions, %d workers",
 		*name, id, *nodes, *n3port, *n5port, *n9port, *sessions, *workers)
+	for iface, b := range map[string]string{"N3": *n3bind, "N5": *n5bind, "N9": *n9bind} {
+		if b != "" {
+			log.Printf("upf %s: %s pinned to bind IP %s", *name, iface, b)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -1,0 +1,74 @@
+# Fabric tunables, one ConfigMap per workload family (each consumed via
+# envFrom; pods also always read `POD_NAME` from the pod spec). Deliberately
+# scoped so each workload only sees its own knobs. The Makefile's `make
+# deploy` includes this file (`oc apply -f deploy/`). Per-pod env (POD_NAME
+# via fieldRef) and credentials (webui DB_DSN) stay in the workload
+# manifests; an explicit `env` entry with an identical name always wins over
+# envFrom, so one-off overrides need no re-render.
+#
+# Values are cluster-DNS-level strings — no node- or cluster-specific data is
+# baked in; the headless DNS suffix follows the NAMESPACE default (`telco`).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: upf-env
+  namespace: telco
+  labels:
+    app.kubernetes.io/part-of: telco-upf-gen
+data:
+  # fabric shape
+  UPF_NODES: "2"
+  UPF_PEER_DNS: "upf-{n}.upf-hs.telco.svc.cluster.local"
+  # data plane
+  N3_PORT: "2152"
+  N5_PORT: "2153"
+  N9_PORT: "2154"
+  # N3_BIND / N5_BIND / N9_BIND: pin a listener to an interface IP (e.g. a
+  # Multus `upf-data` attachment). Empty = wildcard 0.0.0.0 — one socket
+  # serves the default CNI (pod/Service IP), secondary Multus networks and
+  # NodePort/LB DNATs at once.
+  UPF_SESSIONS: "256"
+  UPF_WORKERS: "4"
+  DN_TARGET: ""
+  # SPI/DPI + usage analytics
+  UPF_INSPECTION: "true"
+  # To enable policy rules: mount local/policy.example.yaml as
+  # /etc/upf/policy.yaml via a ConfigMap volume and set the path here.
+  UPF_POLICY: ""
+  UPF_LI_SESSIONS: "0-7"
+  UPF_LI_RING: "1024"
+  UPF_CDR_IDLE: "15s"
+  UPF_CDR_MIN: "1s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tg-env
+  namespace: telco
+  labels:
+    app.kubernetes.io/part-of: telco-upf-gen
+data:
+  # fabric shape (same defaults as upf-env; generators must agree)
+  UPF_NODES: "2"
+  UPF_PEER_DNS: "upf-{n}.upf-hs.telco.svc.cluster.local"
+  UPF_METRICS_PORT: "8080"
+  # injection
+  TG_PPS: "100"
+  TG_MAX_SESSIONS: "32"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webui-env
+  namespace: telco
+  labels:
+    app.kubernetes.io/part-of: telco-upf-gen
+data:
+  ADDR: ":8080"
+  UPF_ENDPOINTS: >-
+    upf-0=http://upf-0.upf-hs.telco.svc.cluster.local:8080,
+    upf-1=http://upf-1.upf-hs.telco.svc.cluster.local:8080
+  TG_ENDPOINTS: >-
+    tg-0=http://trafficgen-0.tg-hs.telco.svc.cluster.local:8080,
+    tg-1=http://trafficgen-1.tg-hs.telco.svc.cluster.local:8080
+  WEBUI_AGG_INTERVAL: "5s"

@@ -35,24 +35,16 @@ spec:
       containers:
         - name: trafficgen
           image: quay.io/midu/trafficgen:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - { name: metrics, containerPort: 8080, protocol: TCP }
           env:
             - name: POD_NAME
               valueFrom:
                 fieldRef: { fieldPath: metadata.name }
-            - name: UPF_NODES
-              value: "2"
-            - name: UPF_PEER_DNS
-              value: upf-{n}.upf-hs.telco.svc.cluster.local
-            - name: UPF_METRICS_PORT
-              value: "8080"
-            # per-flow rate; ~64 flows/replica => ~6.4k pps per generator at 100
-            - name: TG_PPS
-              value: "100"
-            - name: TG_MAX_SESSIONS
-              value: "32"
+          envFrom:
+            - configMapRef:
+                name: tg-env
           readinessProbe:
             httpGet: { path: /healthz, port: metrics }
             initialDelaySeconds: 5

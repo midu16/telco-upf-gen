@@ -650,6 +650,7 @@ the authoritative reference.
 | `UPF_NODES` | `2` | upf, tg | total UPF nodes in the fabric |
 | `UPF_PEER_DNS` | `upf-{n}.upf-hs.telco.svc.cluster.local` | upf, tg | peer DNS template (`{n}` = ordinal) |
 | `N3_PORT` / `N5_PORT` / `N9_PORT` | `2152` / `2153` / `2154` | upf | GTP-U UDP listen ports |
+| `N3_BIND` / `N5_BIND` / `N9_BIND` | *(empty)* | upf | pin a data-plane listener to one interface IP (e.g. a Multus attachment); empty = wildcard `0.0.0.0`, so one socket serves the default CNI, secondary Multus networks and NodePort/LB DNATs simultaneously |
 | `UPF_SESSIONS` | `256` | upf | session space per node |
 | `UPF_WORKERS` | `4` | upf | forwarding worker pool size |
 | `DN_TARGET` | *(empty)* | upf | DN egress `host:port` for plain-IP delivery (empty = count only) |
@@ -677,7 +678,9 @@ binaries): `QUAY_USERNAME`, `QUAY_PASSWORD`, `KUBECONFIG`, plus overridables
 `NAMESPACE`, `IMAGE_REGISTRY`, `IMAGE_OWNER`, `TAG`, `PLATFORMS`,
 `COMPONENTS`, `DB_IMAGE` (default `registry.redhat.io/rhel9/postgresql-16:latest`),
 `DB_AUTHFILE`, and the local-stack `DB_USER` (default `upfgen` — `postgres`
-is a built-in role in that image), `DB_PASSWORD`, `DB_NAME`.
+is a built-in role in that image), `DB_PASSWORD`, `DB_NAME`. The e2e runner
+additionally reads `E2E_EXTERNAL_ADDR` (`<node-ip>:<n3NodePort>`) to drive
+the cross-CNI ingress check; without it that check is skipped.
 
 ---
 
@@ -735,6 +738,80 @@ Key properties:
   sockets, all other capabilities dropped.
 * **`db`** is a single-replica `StatefulSet` with a **PVC** so the metrics /
   usage / state survive pod rescheduling and restarts.
+* **`upf-env` / `tg-env` / `webui-env`** (`deploy/configmap.yaml`) carry
+  every tunable per workload family (fabric shape, ports + bind IPs,
+  inspection, throttle, endpoints, webui settings) consumed via `envFrom`;
+  an explicit `env` entry always wins, so per-deployment overrides need no
+  manifest edits.
+* **`upf-ext`** (`deploy/external-ingress.yaml`) is the NodePort/LoadBalancer
+  GTP-U ingress (udp 32152-32154 + tcp 32151 control) used by cross-CNI
+  validators and off-cluster generators.
+* **Multus NADs** (`deploy/multus.yaml`, `make deploy-multus`) optionally
+  attach the UPF and generator pods to genuine secondary networks — see
+  "CNI topologies" below.
+
+### CNI topologies — same network vs distinct networks
+
+The data plane is CNI-agnostic by construction: forwarders use the F-TEID
+dispatch (no addresses), listeners wildcard-bind by default, replies target
+whatever source address a packet arrived from. The tree deploys a **NodePort
+service** (`upf-ext`, `deploy/external-ingress.yaml`) for gTP-U ingress from
+outside the default network, and optional **Multus attachments**
+(`deploy/multus.yaml`, `make deploy-multus`) that put generator + UPF pods on
+a true secondary networks — both topologies validated with the same e2e
+suite.
+
+#### Same CNI (flat, default)
+
+All workloads ride the default pod network; the headless Service resolves
+each node, traffic never leaves the CNI.
+
+```mermaid
+flowchart LR
+  subgraph NET1["default CNI (flat)"]
+    TG0["trafficgen-0"] -- "GTP-U udp/2152" --> U0["upf-0"]
+    TG0 -- "GTP-U udp/2152" --> U1["upf-1"]
+    WUI["webui"] -- "poll" --> TG0 & U0 & U1
+  end
+  TG0 -. "svc/webui" .- WUI
+  U0 <-->|"N9 fabric"| U1
+```
+
+#### Distinct CNI networks
+
+Three independent sources of load cross network boundaries into the UPF:
+(1) a Multus-attached generator on its own CIDR, (2) an off-cluster
+generator entering through the NodePort/LB service (`upf-ext`), which walks
+campus routing and any NAT between networks, and (3) the webui staying on
+the default CNI throughout.
+
+```mermaid
+flowchart TB
+  subgraph NET2["default CNI"]
+    WUI2["webui (aggregation · DB)"]
+    U02[("upf-0\npod IP via upf-hs\n+ net1 on Multus CIDR")]
+  end
+  subgraph MU["Multus secondary networks (NADs)"]
+    TG2["trafficgen+tg-data\n10.60.0.0/24"] -- "GTP-U udp/2152\n(cross-CNI routed)" --> U02
+  end
+  subgraph OFF["off-premises network"]
+    TGX["bin/trafficgen\n(any host)"] -- "GTP-U udp/32152\nNodePort/LB — routed + NAT" --> ING["svc upf-ext : NodePort 32151-32154"] -- DNAT --> U02
+  end
+  WUI2 -. "poll control 8080" .-> TG2 & U02
+```
+
+#### Validation matrix
+
+| Path | How it gets exercised |
+|---|---|
+| same CNI | always: `make e2e` check *traffic flow* (in-cluster generator + headless DNS) |
+| distinct CNI (Multus) | `make deploy-multus`, then `make e2e` — pods attach `net1` on the NAD CIDRs (verify with `oc -n telco exec upf-0 -- ip -4 addr show net1`) and flow counters increase from the secondary network |
+| distinct CNI (NodePort/LB + campus NAT) | `make e2e E2E_EXTERNAL_ADDR=<node-ip>:32152` — the e2e sends a G-PDU burst from the workstation and asserts every datagram propagates through the DNAT path into the UPF N3 counters |
+
+For an off-cluster generator run, use the ready-made external profile
+(`local/trafficgen-external.yaml`) — it points at the NodePort/LB endpoints
+and the TCP control port 32151 the bench needs for `/api/dn-target`; full
+schema in section 7.4.
 
 ---
 

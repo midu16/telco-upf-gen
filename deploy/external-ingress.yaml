@@ -1,0 +1,32 @@
+# External GTP-U ingress for cross-CNI validation (generators on isolated or
+# routed distinct CNIs, remote nodes, off-cluster bin/trafficgen runs).
+#
+# A NodePort service DNATs udp/<nodePort> on every cluster node into the UPF
+# pods; traffic crosses campus routing (and optional NAT/firewalls), which is
+# exactly the "distinct CNI network" topology. `make e2e
+# E2E_EXTERNAL_ADDR=<node-ip>:32152` drives a real G-PDU burst through here.
+# Ports covered: udp N3/N5/N9 data + tcp 32151 control (the external
+# RFC 2544 bench, which switches the UPF's DN target over /api/dn-target).
+#
+# For opaque providers prefer LoadBalancer (MetalLB / cloud LB) instead —
+# switch the `type` and delete the nodePort entries; nothing else changes
+# (the e2e uses whatever host:port you pass).
+apiVersion: v1
+kind: Service
+metadata:
+  name: upf-ext
+  namespace: telco
+  labels:
+    app: upf
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  type: NodePort
+  selector:
+    app: upf
+  ports:
+    - { name: n3, port: 2152, targetPort: n3, nodePort: 32152, protocol: UDP }
+    - { name: n5, port: 2153, targetPort: n5, nodePort: 32153, protocol: UDP }
+    - { name: n9, port: 2154, targetPort: n9, nodePort: 32154, protocol: UDP }
+    # RFC 2544 control plane for external generators (prometheus scrape +
+    # discovery /api/teids + the bench's DN-target switch /api/dn-target).
+    - { name: control, port: 8080, targetPort: metrics, nodePort: 32151, protocol: TCP }

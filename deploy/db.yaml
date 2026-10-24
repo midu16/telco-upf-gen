@@ -1,5 +1,10 @@
 # Single-node PostgreSQL 16 (registry.redhat.io/rhel9/postgresql-16) on a PVC.
 #
+# Storage is intentionally SC-agnostic: the volumeClaimTemplate sets no
+# storageClassName and binds against the *cluster default* StorageClass.
+# If no default is set yet, run once per cluster:
+#   make storage-default STORAGE_CLASS=lvms-vg1   # (or your provisioner)
+#
 # The webui bridge is the ONLY store writer: it connects with DB_DSN
 # (deploy/webui.yaml). Keep the three credential envs below in sync with the
 # Makefile defaults (DB_USER=upfgen, DB_PASSWORD=postgres, DB_NAME=telco_upf)
@@ -80,6 +85,7 @@ metadata:
     app: db
     app.kubernetes.io/part-of: telco-upf-gen
 spec:
-
+  selector:
+    app: db
   ports:
     - { name: postgres, port: 5432, targetPort: postgres, protocol: TCP }
