@@ -446,7 +446,8 @@ type runEngine struct {
 	teid     uint32
 	redialMu sync.Mutex // guards the conns slice during socket re-creation
 
-	rx         atomic.Uint64
+	rx         atomic.Uint64 // every frame the sink received (incl. background)
+	probeRx    atomic.Uint64 // frames with the bench UE signature (attributed)
 	collectLat atomic.Bool
 	latMu      sync.Mutex
 	lats       []float64 // one-way delay in microseconds since last reset
@@ -615,9 +616,14 @@ func checksum(b []byte) uint16 {
 	return uint16(^ipSum(b) & 0xffff)
 }
 
-// readLoop consumes the sink: every delivered frame bumps the receive
-// window; when latency collection is on, the tx timestamp is read back for
-// a one-way delay sample. Runs until the socket closes.
+// readLoop consumes the sink: every delivered frame bumps the raw receive
+// counter, and frames carrying the bench UE datagram signature also bump
+// the attributed probe counter (the measurement windows count probes only
+// — during a run the UPF egresses the fabric's whole background stream to
+// the same DN socket, so counting raw frames would report phantom
+// "received > sent" and 100% loss on every bisect step). When latency
+// collection is on, a probe's tx timestamp is read back for a one-way
+// delay sample. Runs until the socket closes.
 func (e *runEngine) readLoop() {
 	buf := make([]byte, benchMaxSize+16)
 	for {
@@ -626,9 +632,12 @@ func (e *runEngine) readLoop() {
 			return // socket closed by cleanup
 		}
 		e.rx.Add(1)
-		if e.collectLat.Load() && n >= benchDataOff-gtpu.BaseHeaderLen+16 && buf[0]>>4 == 4 {
-			ihl := int(buf[0]&0x0f) * 4
-			data := buf[ihl+8:] // user data: [8B idx][8B tx ns][filler]
+		if !isProbeDatagram(buf[:n]) {
+			continue
+		}
+		e.probeRx.Add(1)
+		if e.collectLat.Load() {
+			data := buf[28:] // user data: [8B idx][8B tx ns][filler]
 			if len(data) >= 16 {
 				tx := int64(binary.BigEndian.Uint64(data[8:16]))
 				d := time.Now().UnixNano() - tx
@@ -640,6 +649,18 @@ func (e *runEngine) readLoop() {
 			}
 		}
 	}
+}
+
+// isProbeDatagram reports whether a decapped inner datagram is a bench
+// probe: IPv4/IHL-5/UDP from the bench UE (10.254.254.1) to the bench DN
+// (10.254.254.2). Background fabric frames — pod-IP sources and
+// teid-derived 10.99.x.y destinations — never carry that signature.
+func isProbeDatagram(b []byte) bool {
+	if len(b) < 20+8+16 || b[0] != 0x45 || b[9] != 17 {
+		return false
+	}
+	return b[12] == 10 && b[13] == 254 && b[14] == 254 && b[15] == 1 &&
+		b[16] == 10 && b[17] == 254 && b[18] == 254 && b[19] == 2
 }
 
 // resetLats clears the latency sample window.
@@ -658,15 +679,17 @@ func (e *runEngine) latsCopy() []float64 {
 	return out
 }
 
-// drain waits until the sink has been quiet for a while, so leftovers from
-// the previous measurement cannot leak into the next window.
+// drain waits until the attributed probe stream has been quiet for a
+// while, so leftovers from the previous measurement cannot leak into the
+// next window (the background fabric stream is continuous and irrelevant
+// here — windows count probes only).
 func (e *runEngine) drain() {
 	deadline := time.Now().Add(1500 * time.Millisecond)
-	last := e.rx.Load()
+	last := e.probeRx.Load()
 	quiet := time.Now()
 	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
-		cur := e.rx.Load()
+		cur := e.probeRx.Load()
 		if cur != last {
 			last = cur
 			quiet = time.Now()
@@ -845,12 +868,12 @@ func (e *runEngine) settle(ctx context.Context, base, expect uint64) uint64 {
 	var last uint64
 	quiet := start
 	for {
-		got := e.rx.Load() - base
+		got := e.probeRx.Load() - base
 		if expect > 0 && got >= expect {
 			return got
 		}
-		if e.rx.Load() != last {
-			last = e.rx.Load()
+		if e.probeRx.Load() != last {
+			last = e.probeRx.Load()
 			quiet = time.Now()
 		}
 		if time.Since(start) > 100*time.Millisecond && time.Since(quiet) > 250*time.Millisecond {
@@ -880,7 +903,10 @@ func (e *runEngine) result(run *BenchRun, t BenchTest, size int, rate float64, s
 		Received:   got,
 	}
 	if sent > 0 {
-		r.LossPct = 100 * float64(sent-got) / float64(sent)
+		// Float domain first: the uint64 difference wraps when more frames
+		// were delivered than offered (late arrivals), which once surfaced
+		// as loss percentages of 1e20.
+		r.LossPct = 100 * (float64(sent) - float64(got)) / float64(sent)
 		if r.LossPct < 0 {
 			r.LossPct = 0
 		}
@@ -949,7 +975,7 @@ func (e *runEngine) testLoss(ctx context.Context, run *BenchRun, size int, fbs [
 			return out, ctx.Err()
 		}
 		e.drain()
-		base := e.rx.Load()
+		base := e.probeRx.Load()
 		sent, err := e.pacedSend(ctx, fbs, rate, probe)
 		if err != nil {
 			return out, err
@@ -967,7 +993,7 @@ func (e *runEngine) testThroughput(ctx context.Context, run *BenchRun, size int,
 	probe := probeWindow(p)
 	measure := func(rate float64) (sent, got uint64, err error) {
 		e.drain()
-		base := e.rx.Load()
+		base := e.probeRx.Load()
 		sent, err = e.pacedSend(ctx, fbs, rate, probe)
 		if err != nil {
 			return sent, 0, err
@@ -1018,7 +1044,7 @@ func (e *runEngine) testLatency(ctx context.Context, run *BenchRun, size int, fb
 	e.collectLat.Store(true)
 	defer e.collectLat.Store(false)
 
-	base := e.rx.Load()
+	base := e.probeRx.Load()
 	sent, err := e.pacedSend(ctx, fbs, run.Profile.LatencyRate, dur)
 	if err != nil {
 		return nil, err
@@ -1056,7 +1082,7 @@ func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int,
 			break
 		}
 		e.drain()
-		base := e.rx.Load()
+		base := e.probeRx.Load()
 		if err := e.burst(fbs, b); err != nil {
 			return nil, err
 		}
