@@ -145,9 +145,20 @@ offer ≈ **3 Gbps**. To chase 300–900 Gbps:
 
 The bisected **throughput** row you get back is the platform's measured
 lossless line rate at that frame size — assert against it, not against the
-manufacturer leaflets. For wire-grade 300–900 Gbps absorbed at a NIC, the
-generator process needs kernel-bypass delivery (DPDK/AF_XDP netmap class)
-or multi-host fan-out; the fabric topology section in
+manufacturer leaflets. Reference measurements on the SNO (single
+control-plane node, Go kernel sockets, 4 send + 4 rx workers, background
+fabric streaming concurrently):
+
+| Frame size | Lossless up to | Absorption ceiling (delivered) |
+|---|---|---|
+| 64 B | 40 000 pps ≈ 24 Mbps | ≈ 50 000 fps (per-frame bound) |
+| 65 000 B | 3 500 pps ≈ 1.8 Gbps | ≈ 7 400 fps ≈ 2.6–3.7 Gbps |
+
+Small frames are bound by per-frame kernel work (decap + socket), large
+frames by payload copies; both plateaus sit an order of magnitude under
+wire-grade. For 300–900 Gbps absorbed at a NIC, the generator process
+needs kernel-bypass delivery (DPDK/AF_XDP netmap class) or multi-host
+fan-out; the fabric topology section in
 [`docs/architecture.md`](docs/architecture.md) covers the multi-ingress
 paths that way.
 

@@ -852,12 +852,21 @@ outer header) and computes one-way latency from the monotonic transmit stamp.
 Offered bit/s = pps × frame octets × 8, so offered Gbps on the dashboard is
 the product of the rate window and the frame size (1.73 Mpps × 65000 octets
 ≈ 900 Gbps offered). The engine is scalable per profile: `send_workers`
-gives each sender its own N3 socket and token-bucket share, `rx_workers`
-spawns receive loops on the sink; the deployment default (4/4) rides in
-`TG_BENCH_PROFILE` on `deploy/configmap.yaml`. Because the path is Go
-kernel sockets (no DPDK/AF_XDP), the achievable lossless rate — what the
-throughput bisection reports — is memory-bandwidth bound; scale the workers
-with `deploy/*.yaml` CPU limits and `UPF_WORKERS`.
+gives each sender its own N3 socket and slot on a phase-offset global grid
+(worker *i* owns slots congruent to *i* mod *k*, so the offered load is
+conservation-exact from single-digit pps upward — no per-worker token-bucket
+floor), `rx_workers` spawns receive loops on the sink; the deployment
+default (4/4) rides in `TG_BENCH_PROFILE` on `deploy/configmap.yaml`.
+Because the path is Go kernel sockets (no DPDK/AF_XDP), the achievable
+lossless rate — what the throughput bisection reports — is
+memory-bandwidth bound; scale the workers with `deploy/*.yaml` CPU limits
+and `UPF_WORKERS`.
+
+Measured reference on the SNO (4×4 workers, background streaming): 64 B
+frames stay lossless to 40 kpps and the sink absorbs ≈50 kfps regardless
+of offer; 65 000 B frames stay lossless to ≈3.5 kpps (≈1.8 Gbps offered)
+with an absorption plateau of ≈7.4 kfps (≈2.6–3.7 Gbps delivered). Both
+plateaus are the kernel-socket path, not the grid.
 
 A run follows the YAML/JSON **profile** (frame sizes × tests × rates). Runs
 are kept in generator memory (last 10) with their own `run_id`, status and
