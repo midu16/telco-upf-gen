@@ -712,18 +712,21 @@ func isRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
-// pacedSend offers `rate` frames per second for `dur`, split evenly across
-// the run's send sockets: worker i runs its own 100us-token-bucket loop at
-// rate/k on its own socket and frame template (concurrent stamping never
-// shares a buffer). Blocking writes make the senders self-throttle as the
-// kernel queues fill instead of erroring out. Returns the frames actually
-// offered; a write error or context cancellation aborts the measurement.
+// pacedSend offers `rate` frames per second for `dur`, spread across the
+// send sockets by a phase-offset global slot grid (conservation-exact, no
+// per-worker floor). Each worker stamps its own frame template (concurrent
+// stamping never shares a buffer) and writes on its own socket, so the
+// senders self-throttle as the kernel queues fill instead of erroring out.
+// Returns the frames actually offered; a write error or context
+// cancellation aborts the measurement.
 func (e *runEngine) pacedSend(ctx context.Context, fbs []*frameBuilder, rate float64, dur time.Duration) (uint64, error) {
 	end := time.Now().Add(dur)
 	var sent atomic.Uint64
-	share := rate / float64(len(e.conns))
+	// paceWindow consumes the GLOBAL rate: the slot grid is phase-offset per
+	// worker and each worker steps k slots, so the k workers together offer
+	// exactly `rate` frames/s (not rate/k each).
 	err := e.sendJob(func(i int) error {
-		return e.paceWindow(ctx, i, fbs[i], share, end, &sent)
+		return e.paceWindow(ctx, i, fbs[i], rate, end, &sent)
 	})
 	if ctx.Err() != nil {
 		err = ctx.Err()
@@ -731,40 +734,67 @@ func (e *runEngine) pacedSend(ctx context.Context, fbs []*frameBuilder, rate flo
 	return sent.Load(), err
 }
 
-// paceWindow is one sender's token-bucket loop (100us tick): offer frames
-// at the given rate share until `end`, counting into `sent`. A refused
-// write re-dials the worker's socket and retries the same frame once — a
-// stale UDP ICMP must not abort a multi-minute measurement.
+// paceWindow offers exactly the framed slots assigned to worker i from a
+// global slot grid spaced 1/rate apart: worker i owns the slots congruent
+// to i mod k (k = workers), so across workers every global slot is sent
+// exactly once and the total offered load is rate × dur — with no
+// per-worker floor (a share-split token bucket cannot express 3.9 frames
+// in a 250 ms window). Overdue slots catch up in bounded batches, so a
+// stalled sender heals without collapsing the schedule.
 func (e *runEngine) paceWindow(ctx context.Context, i int, fb *frameBuilder, rate float64, end time.Time, sent *atomic.Uint64) error {
+	if rate <= 0 || !end.After(time.Now()) {
+		return nil
+	}
+	iv := 1e9 / rate // nanoseconds between global slots
+	if iv < 1 {
+		iv = 1
+	}
+	k := len(e.conns)
+	unixEnd := float64(end.UnixNano())
 	conn := e.connFor(i)
-	var carry float64
-	last := time.Now()
+	due := float64(time.Now().UnixNano()) + float64(i)*iv
+	const maxBatch = 256
 	for {
-		now := time.Now()
-		if now.After(end) {
+		now := float64(time.Now().UnixNano())
+		if now >= unixEnd {
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if d := due - now; d > 0 {
+			t := time.NewTimer(time.Duration(d))
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
+			now = float64(time.Now().UnixNano())
+			if now >= unixEnd {
+				return nil
+			}
 		}
-		carry += rate * now.Sub(last).Seconds()
-		last = now
-		n := int(carry)
-		carry -= float64(n)
-		for j := 0; j < n; j++ {
+		var werr error
+		for b := 0; b < maxBatch && due < float64(time.Now().UnixNano()); b++ {
 			fb.stamp()
-			var werr error
 			conn, werr = e.offerOnce(i, conn, fb)
 			if werr != nil {
 				return werr
 			}
 			sent.Add(1)
+			due += float64(k) * iv
+			if due >= unixEnd {
+				return nil
+			}
 		}
-		next := last.Add(100 * time.Microsecond)
-		if time.Until(next) > 0 && next.Before(end) {
-			time.Sleep(time.Until(next))
+		// the slot that scheduled this wake-up
+		fb.stamp()
+		conn, werr = e.offerOnce(i, conn, fb)
+		if werr != nil {
+			return werr
+		}
+		sent.Add(1)
+		due += float64(k) * iv
+		if due >= unixEnd {
+			return nil
 		}
 	}
 }
