@@ -45,6 +45,11 @@ spec:
               value: >-
                 tg-0=http://trafficgen-0.tg-hs.telco.svc.cluster.local:8080,
                 tg-1=http://trafficgen-1.tg-hs.telco.svc.cluster.local:8080
+            # Sole store writer. Keep in sync with deploy/db.yaml envs
+            # (POSTGRESQL_USER/POSTGRESQL_PASSWORD/POSTGRESQL_DATABASE) and
+            # the Makefile / e2e defaults (DB_USER/DB_PASSWORD/DB_NAME).
+            - name: DB_DSN
+              value: postgres://upfgen:postgres@db.telco.svc.cluster.local:5432/telco_upf?sslmode=disable
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2

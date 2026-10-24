@@ -66,6 +66,13 @@ make deploy         # oc apply -f deploy/ against $KUBECONFIG
 make e2e            # live-cluster end-to-end suite
 ```
 
+> The `db` StatefulSet (`deploy/db.yaml`) uses the
+> `registry.redhat.io/rhel9/postgresql-16` image; if the cluster pull secret
+> does not cover `registry.redhat.io`, attach one to the `telco` service
+> accounts or point that image at a mirror. The webui's `DB_DSN`
+> (`deploy/webui.yaml`) must stay in sync with the DB envs in
+> `deploy/db.yaml` — the `make e2e` defaults (`E2E_DB_*`) match both.
+
 Useful local-only flows:
 
 ```bash

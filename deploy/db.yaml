@@ -1,0 +1,85 @@
+# Single-node PostgreSQL 16 (registry.redhat.io/rhel9/postgresql-16) on a PVC.
+#
+# The webui bridge is the ONLY store writer: it connects with DB_DSN
+# (deploy/webui.yaml). Keep the three credential envs below in sync with the
+# Makefile defaults (DB_USER=upfgen, DB_PASSWORD=postgres, DB_NAME=telco_upf)
+# so `make e2e` (E2E_DB_* defaults) and `make test-local` match as well.
+#
+# registry.redhat.io needs credentials: if the cluster's pull secret does not
+# cover it, attach a pull secret to the `db` service account or re-point the
+# image below (and `DB_IMAGE` in the Makefile) at a mirror the cluster trusts.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: telco
+  labels:
+    app: db
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+  serviceName: db
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+        app.kubernetes.io/part-of: telco-upf-gen
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        securityContextConstraints:
+          name: upf-udp
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: db
+          image: registry.redhat.io/rhel9/postgresql-16:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: postgres, containerPort: 5432, protocol: TCP }
+          env:
+            - name: POSTGRESQL_USER
+              value: upfgen
+            - name: POSTGRESQL_PASSWORD
+              value: postgres
+            - name: POSTGRESQL_DATABASE
+              value: telco_upf
+          readinessProbe:
+            tcpSocket: { port: postgres }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: postgres }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: telco
+  labels:
+    app: db
+    app.kubernetes.io/part-of: telco-upf-gen
+spec:
+
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres, protocol: TCP }

@@ -693,7 +693,7 @@ flowchart TB
     direction TB
 
     subgraph SCC["SecurityContextConstraints"]
-      SCC1["privileged / anyuid\n(for raw UDP GTP-U + raw sockets)"]
+      SCC1["upf-udp: non-root\nNET_BIND_SERVICE only\n(anyuid/fsGroup RunAsAny)"]
     end
 
     subgraph DATA["data plane"]
@@ -730,8 +730,9 @@ Key properties:
 * **GTP-U is UDP**, so the Services expose UDP on 2152/2153/2154. External
   load comes in through a NodePort/LoadBalancer service (the "external
   ingress" path) or by running `bin/trafficgen` off-cluster in *external* mode.
-* A permissive **SCC** (anyuid / privileged) lets the pods open the raw UDP
-  sockets and, where the platform allows, set socket buffers for the hot path.
+* A dedicated **SCC** (`upf-udp`) lets the non-root pods bind the GTP-U UDP
+  ports below 1024 via `NET_BIND_SERVICE` — no host namespaces, no raw
+  sockets, all other capabilities dropped.
 * **`db`** is a single-replica `StatefulSet` with a **PVC** so the metrics /
   usage / state survive pod rescheduling and restarts.
 
