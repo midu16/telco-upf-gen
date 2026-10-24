@@ -482,12 +482,27 @@ func (e *e2e) checkDB() error {
 	if kb["source"] != "db" {
 		return fmt.Errorf("knob source = %v, want db (state not persisting)", kb["source"])
 	}
-	var raw string
-	if err := db.QueryRowContext(e.ctx, `SELECT value::text FROM ui_state WHERE key=$1`, "throttle").Scan(&raw); err != nil {
-		return fmt.Errorf("read ui_state: %w", err)
-	}
-	if !strings.Contains(raw, "88") {
-		return fmt.Errorf("ui_state throttle = %s, want 88", raw)
+	// The ui_state row is written by the webui's persistence cycle, not
+	// synchronously with the POST: poll for the 88 so a leftover row from a
+	// previous run's restore ({"pct":100}) cannot win the race.
+	knDeadline := time.Now().Add(30 * time.Second)
+	for {
+		var raw string
+		if err := db.QueryRowContext(e.ctx, `SELECT value::text FROM ui_state WHERE key=$1`, "throttle").Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read ui_state: %w", err)
+		}
+		if strings.Contains(raw, "88") {
+			log.Printf("   ui_state throttle: %s (round-tripped)", raw)
+			break
+		}
+		if time.Now().After(knDeadline) {
+			return fmt.Errorf("ui_state throttle = %q, want 88 (flush window exceeded)", raw)
+		}
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return postJSON(base+"/api/knob", `{"pct":100}`, nil)
 }
@@ -517,22 +532,50 @@ func (e *e2e) checkCDR() error {
 	}
 	defer stop()
 	defer db.Close()
-	// CDRs close after the session idle window (default 15s) + one bridge
-	// poll; give it room.
-	deadline := time.Now().Add(3 * time.Minute)
-	for {
+
+	// CDRs close on the session idle window (default 15s): a session earns a
+	// CDR only after staying packetless that long. Steady-state fabric at
+	// 100% never idles any touched session — exactly what the earlier
+	// checks left running — so the check itself creates the idle window:
+	// every generator drops to 0 through the webui knob, wait for the
+	// ledger to sweep, restore afterwards.
+	webui, stopKnob := e.portForward("webui-knob", "svc/webui", 18084, 80)
+	defer stopKnob()
+	base := "http://" + webui
+
+	rowsAt := func() int {
 		var n int
 		if err := db.QueryRowContext(e.ctx, `SELECT count(*) FROM cdr`).Scan(&n); err != nil {
-			return err
+			return -1
 		}
-		if n > 0 {
-			log.Printf("   cdr rows: %d", n)
+		return n
+	}
+	start := rowsAt()
+
+	if err := postJSON(base+"/api/knob", `{"pct":0}`, nil); err != nil {
+		return fmt.Errorf("pause traffic (knob 0): %w", err)
+	}
+
+	// idle window + ledger CloseIdle sweep + bridge poll + upsert
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		n := rowsAt()
+		if n > start {
+			// Restore before reporting (checked; the defer covers early exits).
+			if err := postJSON(base+"/api/knob", `{"pct":100}`, nil); err != nil {
+				return fmt.Errorf("restore knob 100: %w", err)
+			}
+			log.Printf("   cdr rows: start=%d now=%d (idle-window closure verified)", start, n)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.New("no CDR rows after 3m (idle window + flush latency exceeded)")
+			return fmt.Errorf("no CDR rows within 90s of zero-offer (start=%d; idle window + flush latency exceeded)", start)
 		}
-		time.Sleep(5 * time.Second)
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 

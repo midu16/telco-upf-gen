@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/midu/telco-upf-gen/internal/gtpu"
@@ -439,9 +440,11 @@ func (b *Bench) execute(ctx context.Context, run *BenchRun) {
 type runEngine struct {
 	deps BenchDeps
 
-	conns []*net.UDPConn // bench egress sockets: G-PDUs to the UPF N3 port
-	sink  *net.UDPConn   // receives the plain-IP frames the UPF egresses
-	teid  uint32
+	dst      *net.UDPAddr   // fabric N3 endpoint every send socket dials
+	conns    []*net.UDPConn // bench egress sockets: G-PDUs to the UPF N3 port
+	sink     *net.UDPConn   // receives the plain-IP frames the UPF egresses
+	teid     uint32
+	redialMu sync.Mutex // guards the conns slice during socket re-creation
 
 	rx         atomic.Uint64
 	collectLat atomic.Bool
@@ -507,6 +510,7 @@ func newRunEngine(deps BenchDeps, run *BenchRun) (*runEngine, func(), error) {
 		}
 		e.conns = append(e.conns, conn)
 	}
+	e.dst = dst
 
 	// The receive side scales the same way: k loops drain the shared sink
 	// socket, so no single goroutine bottlenecks a jumbo measurement.
@@ -674,6 +678,40 @@ func (e *runEngine) drain() {
 	}
 }
 
+// connFor returns send socket i (mutex-guarded because redial swaps it).
+func (e *runEngine) connFor(i int) *net.UDPConn {
+	e.redialMu.Lock()
+	defer e.redialMu.Unlock()
+	return e.conns[i]
+}
+
+// redial replaces send socket i after an ICMP "connection refused" — the
+// kernel surfaces a stale unreachable-state on a UDP socket for every later
+// write once a flow was refused; a fresh dial reconnects to the (possibly
+// restarted) anchor instead of aborting the measurement.
+func (e *runEngine) redial(i int) {
+	e.redialMu.Lock()
+	defer e.redialMu.Unlock()
+	c, err := net.DialUDP("udp", nil, e.dst)
+	if err != nil {
+		return // keep the old socket; the next write retries
+	}
+	old := e.conns[i]
+	e.conns[i] = c
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+// isRefused classifies the stale-ICMP write failure.
+func isRefused(err error) bool {
+	var oerr *net.OpError
+	if errors.As(err, &oerr) {
+		return errors.Is(oerr.Err, syscall.ECONNREFUSED)
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
 // pacedSend offers `rate` frames per second for `dur`, split evenly across
 // the run's send sockets: worker i runs its own 100us-token-bucket loop at
 // rate/k on its own socket and frame template (concurrent stamping never
@@ -685,7 +723,7 @@ func (e *runEngine) pacedSend(ctx context.Context, fbs []*frameBuilder, rate flo
 	var sent atomic.Uint64
 	share := rate / float64(len(e.conns))
 	err := e.sendJob(func(i int) error {
-		return paceWindow(ctx, e.conns[i], fbs[i], share, end, &sent)
+		return e.paceWindow(ctx, i, fbs[i], share, end, &sent)
 	})
 	if ctx.Err() != nil {
 		err = ctx.Err()
@@ -694,8 +732,11 @@ func (e *runEngine) pacedSend(ctx context.Context, fbs []*frameBuilder, rate flo
 }
 
 // paceWindow is one sender's token-bucket loop (100us tick): offer frames
-// at the given rate share until `end`, counting into `sent`.
-func paceWindow(ctx context.Context, conn *net.UDPConn, fb *frameBuilder, rate float64, end time.Time, sent *atomic.Uint64) error {
+// at the given rate share until `end`, counting into `sent`. A refused
+// write re-dials the worker's socket and retries the same frame once — a
+// stale UDP ICMP must not abort a multi-minute measurement.
+func (e *runEngine) paceWindow(ctx context.Context, i int, fb *frameBuilder, rate float64, end time.Time, sent *atomic.Uint64) error {
+	conn := e.connFor(i)
 	var carry float64
 	last := time.Now()
 	for {
@@ -712,10 +753,12 @@ func paceWindow(ctx context.Context, conn *net.UDPConn, fb *frameBuilder, rate f
 		last = now
 		n := int(carry)
 		carry -= float64(n)
-		for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
 			fb.stamp()
-			if _, err := conn.Write(fb.tmpl); err != nil {
-				return err
+			var werr error
+			conn, werr = e.offerOnce(i, conn, fb)
+			if werr != nil {
+				return werr
 			}
 			sent.Add(1)
 		}
@@ -724,6 +767,19 @@ func paceWindow(ctx context.Context, conn *net.UDPConn, fb *frameBuilder, rate f
 			time.Sleep(time.Until(next))
 		}
 	}
+}
+
+// offerOnce writes exactly one framed copy, re-dialing around a refused
+// write (stale UDP ICMP state) and retrying the frame.
+func (e *runEngine) offerOnce(i int, conn *net.UDPConn, fb *frameBuilder) (*net.UDPConn, error) {
+	_, err := conn.Write(fb.tmpl)
+	if err == nil || !isRefused(err) {
+		return conn, err
+	}
+	e.redial(i)
+	conn = e.connFor(i)
+	_, err = conn.Write(fb.tmpl)
+	return conn, err
 }
 
 // sendJob runs fn(i) once per send socket, concurrently; returns the first
@@ -992,16 +1048,19 @@ func (e *runEngine) testBackToBack(ctx context.Context, run *BenchRun, size int,
 // each socket shares n/k plus one for the first n%k workers.
 func (e *runEngine) burst(fbs []*frameBuilder, n int) error {
 	return e.sendJob(func(i int) error {
-		conn, fb := e.conns[i], fbs[i]
+		conn := e.connFor(i)
+		fb := fbs[i]
 		share := n / len(e.conns)
 		if i < n%len(e.conns) {
 			share++
 		}
 		for j := 0; j < share; j++ {
 			fb.stamp()
-			if _, err := conn.Write(fb.tmpl); err != nil {
-				return err
+			conn, werr := e.offerOnce(i, conn, fb)
+			if werr != nil {
+				return werr
 			}
+			_ = conn
 		}
 		return nil
 	})
